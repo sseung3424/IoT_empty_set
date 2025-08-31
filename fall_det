@@ -16,7 +16,7 @@ while True:
     results = model(frame)
     annotated_frame = results[0].plot()
 
-    for kpt in results[0].keypoints.xy:  # keypoints: [n, num_points, 2]
+    for box, kpt in zip(results[0].boxes, results[0].keypoints.xy):
         # 예: [0: nose, 5: left shoulder, 6: right shoulder, 11: left hip, 12: right hip]
         try:
             left_shoulder = kpt[5]
@@ -31,11 +31,15 @@ while True:
             height = abs(center_top[1] - center_bottom[1])
 
             if width > 0 and (height / width) < 0.5:
-                cv2.putText(annotated_frame, "Lying Down", (30, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                label = "Lying down"
+                color = (0, 0, 255)
             else:
-                cv2.putText(annotated_frame, "Standing / Sitting", (30, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                label = "Standing / Sitting"
+                color = (0, 255, 0)
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cv2.putText(annotated_frame, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
         except Exception as e:
             print("Keypoint missing:", e)
