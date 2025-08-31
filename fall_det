@@ -1,0 +1,48 @@
+# main이랑 병합 이전
+
+from ultralytics import YOLO
+import cv2
+
+# 누워있는지 판단
+
+model = YOLO("yolov8n-pose.pt")
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model(frame)
+    annotated_frame = results[0].plot()
+
+    for kpt in results[0].keypoints.xy:  # keypoints: [n, num_points, 2]
+        # 예: [0: nose, 5: left shoulder, 6: right shoulder, 11: left hip, 12: right hip]
+        try:
+            left_shoulder = kpt[5]
+            right_shoulder = kpt[6]
+            left_hip = kpt[11]
+            right_hip = kpt[12]
+
+            center_top = (left_shoulder + right_shoulder) / 2
+            center_bottom = (left_hip + right_hip) / 2
+
+            width = abs(left_shoulder[0] - right_shoulder[0])
+            height = abs(center_top[1] - center_bottom[1])
+
+            if width > 0 and (height / width) < 0.5:
+                cv2.putText(annotated_frame, "Lying Down", (30, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            else:
+                cv2.putText(annotated_frame, "Standing / Sitting", (30, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+
+        except Exception as e:
+            print("Keypoint missing:", e)
+
+    cv2.imshow("Pose Detection", annotated_frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
