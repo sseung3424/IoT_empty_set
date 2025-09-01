@@ -2,7 +2,6 @@ from google.cloud import texttospeech
 import pygame
 import tempfile
 
-# Google TTS 클라이언트 초기화
 tts_client = texttospeech.TextToSpeechClient()
 
 def text_to_speech(text: str):
@@ -23,13 +22,11 @@ def text_to_speech(text: str):
         audio_config=audio_config
     )
 
-    # delete=False 로 파일 삭제 방지
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
         temp_audio.write(response.audio_content)
         temp_audio_path = temp_audio.name
 
-    # pygame으로 재생
-    pygame.mixer.init()
+    pygame.mixer.init(frequency=22050)
     pygame.mixer.music.load(temp_audio_path)
     pygame.mixer.music.play()
 

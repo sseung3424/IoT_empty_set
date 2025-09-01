@@ -1,11 +1,14 @@
+# stt.py
 from google.cloud import speech
 import pyaudio
 import queue
+import threading
 
 stt_client = speech.SpeechClient()
 
 RATE = 16000
 CHUNK = int(RATE / 10)
+MIC_INDEX = None  # None - basic mic, configure index for selecting USB mic
 
 def stream_generator(q):
     while True:
@@ -14,13 +17,14 @@ def stream_generator(q):
             return
         yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-def listen_and_recognize():
+def speech_to_text():
     audio_interface = pyaudio.PyAudio()
     audio_stream = audio_interface.open(
         format=pyaudio.paInt16,
         channels=1,
         rate=RATE,
         input=True,
+        input_device_index=MIC_INDEX,  # select USB mic
         frames_per_buffer=CHUNK,
     )
 
@@ -33,32 +37,41 @@ def listen_and_recognize():
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=config,
-        interim_results=False 
+        interim_results=False
     )
 
     def fill_buffer():
         while True:
-            data = audio_stream.read(CHUNK)
-            q.put(data)
+            try:
+                data = audio_stream.read(CHUNK, exception_on_overflow=False)
+                q.put(data)
+            except Exception as e:
+                print("[ERROR] Mic read:", e)
+                break
 
-    import threading
     threading.Thread(target=fill_buffer, daemon=True).start()
 
     requests = stream_generator(q)
     responses = stt_client.streaming_recognize(streaming_config, requests)
 
-    print("say, I'm hearing")
+    print("Listening...")
+
+    final_text = ""
     try:
         for response in responses:
             for result in response.results:
                 if result.is_final:
-                    print("final recognition:", result.alternatives[0].transcript)
-    except KeyboardInterrupt:
-        print("\naudio recogniction stops")
+                    final_text = result.alternatives[0].transcript
+                    q.put(None)
+                    audio_stream.stop_stream()
+                    audio_stream.close()
+                    audio_interface.terminate()
+                    print("Recognized:", final_text)
+                    return final_text
+    except Exception as e:
+        print("[ERROR] STT:", e)
         q.put(None)
         audio_stream.stop_stream()
         audio_stream.close()
         audio_interface.terminate()
-
-if __name__ == "__main__":
-    listen_and_recognize()
+        return ""
