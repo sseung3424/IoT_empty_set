@@ -1,9 +1,9 @@
-# main이랑 병합 이전
+# before merge
 
 from ultralytics import YOLO
 import cv2
 
-# 누워있는지 판단
+# determine lying
 
 model = YOLO("yolov8n-pose.pt")
 cap = cv2.VideoCapture(0)
@@ -17,7 +17,7 @@ while True:
     annotated_frame = results[0].plot()
 
     for box, kpt in zip(results[0].boxes, results[0].keypoints.xy):
-        # 예: [0: nose, 5: left shoulder, 6: right shoulder, 11: left hip, 12: right hip]
+        # ex: [0: nose, 5: left shoulder, 6: right shoulder, 11: left hip, 12: right hip]
         try:
             left_shoulder = kpt[5]
             right_shoulder = kpt[6]
