@@ -1,25 +1,20 @@
+# llm.py
 import os
-from dotenv import load_dotenv
 import google.generativeai as genai
 
-load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise RuntimeError("check env file")
+    raise RuntimeError("GEMINI_API_KEY not set. Ensure main.py calls load_dotenv() and .env has the key.")
 
-# Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash-latest")
+_gemini = genai.GenerativeModel("gemini-1.5-flash-latest")
 
-# Gemini API call function
 def ask_gemini(user_input: str) -> str:
     try:
-        response = model.generate_content(
-            [
-                "You are a kind chatbot for people who live alone or elderly people living by themselves. Please answer in a warm tone, without using emojis, and keep your replies from being too long.",
-                user_input
-            ]
-        )
-        return response.text.strip()
+        resp = _gemini.generate_content([
+            "You are a kind chatbot for people who live alone or elderly people living by themselves. Please answer in a warm tone, without using emojis, and keep your replies from being too long.",
+            user_input
+        ])
+        return resp.text.strip()
     except Exception as e:
         return f"[ERROR] {e}"

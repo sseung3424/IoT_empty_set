@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import RPi.GPIO as GPIO
-import YB_Pcb_Car  # Yahboom car library
+import yb_car  # Yahboom car library
 from typing import Optional
 
 class HumanFollower:
@@ -43,7 +43,7 @@ class HumanFollower:
         self.model = YOLO(model_path)
 
         # Car
-        self.car = YB_Pcb_Car.YB_Pcb_Car()
+        self.car = yb_car.YB_Pcb_Car()
 
         # Params
         self.show_window = show_window
