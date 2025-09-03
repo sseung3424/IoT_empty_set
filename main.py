@@ -195,17 +195,17 @@ if __name__ == "__main__":
     stop_event = threading.Event()
 
     # Single camera -> unified loop handles both fall detection & tracking
-    cam_thread = threading.Thread(
-        target=unified_camera_loop,
-        kwargs={
-            "stop_event": stop_event,
-            "camera_index": 0,
-            "width": 640, "height": 480, "fps": 30,
-            "show_window": False  # set True when you connect a display or use VNC
-        },
-        daemon=True
-    )
-    cam_thread.start()
+    # cam_thread = threading.Thread(
+    #     target=unified_camera_loop,
+    #     kwargs={
+    #         "stop_event": stop_event,
+    #         "camera_index": 0,
+    #         "width": 640, "height": 480, "fps": 30,
+    #         "show_window": False  # set True when you connect a display or use VNC
+    #     },
+    #     daemon=True
+    # )
+    # cam_thread.start()
 
     # Run chatbot on main thread (Ctrl+C responsive)
     try:
@@ -214,8 +214,8 @@ if __name__ == "__main__":
         stop_event.set()
     finally:
         stop_event.set()
-        try:
-            cam_thread.join(timeout=1.0)
-        except RuntimeError:
-            pass
+        # try:
+        #     cam_thread.join(timeout=1.0)
+        # except RuntimeError:
+        #     pass
         print("all threads stopped")
