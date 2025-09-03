@@ -199,7 +199,7 @@ if __name__ == "__main__":
         target=unified_camera_loop,
         kwargs={
             "stop_event": stop_event,
-            "camera_index": 10,
+            "camera_index": 0,
             "width": 640, "height": 480, "fps": 30,
             "show_window": False  # set True when you connect a display or use VNC
         },
