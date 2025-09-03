@@ -212,7 +212,7 @@ class HumanFollower:
 
 def run_tracking_thread(
     stop_event: Optional["threading.Event"] = None,
-    camera_index: int = 10,
+    camera_index: int = 0,
     show_window: bool = False
 ):
     """
