@@ -6,7 +6,7 @@ import threading
 
 stt_client = speech.SpeechClient()
 
-RATE = 16000
+RATE = 44100
 CHUNK = int(RATE / 10)
 MIC_INDEX = 2  # None - basic mic, configure index for selecting USB mic
 
