@@ -84,7 +84,7 @@ def chatbot_loop(stop_event: threading.Event):
 
 
 def unified_camera_loop(stop_event: threading.Event,
-                        camera_index: int = 0,
+                        camera_index: int = 10,
                         width: int = 640, height: int = 480, fps: int = 30,
                         show_window: bool = False):
     """
