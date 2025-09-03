@@ -23,7 +23,7 @@ class HumanFollower:
     def __init__(
         self,
         model_path: str = "yolov8n-pose.pt",     # person class available in generic YOLO
-        camera_index: int = 10,
+        camera_index: int = 0,
         show_window: bool = False,          # set True for debug visualization
         roi_ratio: float = 0.5,             # use lower 50% as ROI
         lost_timeout_s: float = 1.0,        # stop if person lost for this duration
