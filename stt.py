@@ -8,7 +8,7 @@ stt_client = speech.SpeechClient()
 
 RATE = 16000
 CHUNK = int(RATE / 10)
-MIC_INDEX = 3  # None - basic mic, configure index for selecting USB mic
+MIC_INDEX = 2  # None - basic mic, configure index for selecting USB mic
 
 def stream_generator(q):
     while True:
