@@ -1,221 +1,65 @@
-# main.py
-from dotenv import load_dotenv
-load_dotenv()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Speaker test (USB headset preferred).
+- Plays 440 Hz tone (1s) then L/R channel check (1.5s).
+"""
 
-import cv2
-import threading
+import numpy as np
+import sounddevice as sd
 import time
 
-from fall_det import FallDetector, cleanup
-from tts import text_to_speech
-from stt import speech_to_text
-from llm import ask_gemini
+SAMPLE_RATE = 16000  # 16 kHz is enough for tests
 
-# Robot control (motors/servo via I2C)
-from yb_car import YB_Pcb_Car
+def find_output_device():
+    """Pick an output device that looks like a USB headset if available."""
+    devices = sd.query_devices()
+    # Prefer devices that look like USB/Headset/Audio
+    for i, d in enumerate(devices):
+        name = d["name"].lower()
+        if d["max_output_channels"] > 0 and any(k in name for k in ["usb", "headset", "audio"]):
+            return i
+    # Fallback: first device with output channels
+    for i, d in enumerate(devices):
+        if d["max_output_channels"] > 0:
+            return i
+    return None
 
-# Tracking module (interface can vary across your codebase)
-try:
-    import tracking as tracking_mod
-except Exception:
-    tracking_mod = None
+def play_tone(frequency=440.0, seconds=1.0):
+    """Play a mono sine tone to both channels."""
+    t = np.linspace(0, seconds, int(SAMPLE_RATE * seconds), endpoint=False)
+    tone = 0.2 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+    stereo = np.stack([tone, tone], axis=1)
+    sd.play(stereo, SAMPLE_RATE, blocking=True)
 
-def init_tracker(car):
-    """
-    Try to initialize the tracking interface.
-    Supported patterns:
-      1) Class-based: tracking.PersonTracker([car]) with update(frame) or process_frame(frame)
-      2) Function-based: tracking.process_frame(frame, [car])
-    Returns: (tracker_obj, track_fn)
-    """
-    tracker_obj, track_fn = None, None
-    if tracking_mod:
-        if hasattr(tracking_mod, "PersonTracker"):
-            try:
-                tracker_obj = tracking_mod.PersonTracker(car=car)
-            except TypeError:
-                tracker_obj = tracking_mod.PersonTracker()
-        elif hasattr(tracking_mod, "process_frame"):
-            track_fn = tracking_mod.process_frame
-    return tracker_obj, track_fn
+def lr_check(frequency=660.0):
+    """Play left-only, right-only, then both (0.5s each)."""
+    seg = int(0.5 * SAMPLE_RATE)
+    t = np.linspace(0, 0.5, seg, endpoint=False)
+    wave = 0.2 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
 
+    left = np.zeros((seg, 2), dtype=np.float32);  left[:, 0] = wave
+    right = np.zeros((seg, 2), dtype=np.float32); right[:, 1] = wave
+    both = np.stack([wave, wave], axis=1)
 
-def chatbot_loop(stop_event: threading.Event):
-    """
-    Voice chatbot loop.
-    - STT for input
-    - LLM for response
-    - TTS for output
-    - Say 'exit' to stop everything
-    """
-    print("chatbot - say 'exit' to stop")
-    while not stop_event.is_set():
-        try:
-            user_msg = speech_to_text()
-        except Exception as e:
-            print(f"[STT ERROR] {e}")
-            time.sleep(0.2)
-            continue
+    sd.play(np.concatenate([left, right, both], axis=0), SAMPLE_RATE, blocking=True)
 
-        if not user_msg:
-            time.sleep(0.05)
-            continue
-
-        print("user:", user_msg)
-
-        if user_msg.strip().lower() == "exit":
-            print("chatbot stops")
-            stop_event.set()
-            break
-
-        print("chatbot: thinking...")
-        try:
-            reply = ask_gemini(user_msg)  # should return a string
-        except Exception as e:
-            reply = f"[ERROR] LLM failed: {e}"
-
-        print("chatbot:\n" + (reply or ""))
-
-        if reply and not reply.startswith("[ERROR]"):
-            try:
-                text_to_speech(reply)
-            except Exception as e:
-                print(f"[TTS ERROR] {e}")
-
-
-def unified_camera_loop(stop_event: threading.Event,
-                        camera_index: int = 0,
-                        width: int = 640, height: int = 480, fps: int = 30,
-                        show_window: bool = False):
-    """
-    Unified camera loop:
-      - Single capture for both fall detection and tracking (no device conflicts)
-      - Optional GUI window via `show_window`
-      - Tracking is expected to command the robot through YB_Pcb_Car
-    """
-    car = YB_Pcb_Car()
-
-    tracker_obj, track_fn = init_tracker(car)
-    detector = FallDetector()
-
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        print(f"[ERROR] Camera {camera_index} open failed.")
-        return
-
-    # Reasonable performance settings for Raspberry Pi
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS,          fps)
-
-    time.sleep(0.5)  # warm-up
-
-    if tracking_mod is None:
-        print("[WARN] tracking module not found -> tracking disabled")
-    elif tracker_obj is None and track_fn is None:
-        print("[WARN] tracking interface not found -> tracking disabled")
+def main():
+    out_idx = find_output_device()
+    if out_idx is not None:
+        sd.default.device = (None, out_idx)
+        print(f"[Output] Using device {out_idx}: {sd.query_devices(out_idx)['name']}")
     else:
-        print("[INFO] tracking enabled")
+        print("[Output] Using system default.")
 
-    try:
-        while not stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok:
-                print("[WARN] Camera read failed; retrying...")
-                time.sleep(0.03)
-                continue
+    print("Playing 440 Hz...")
+    play_tone(440.0, 1.0)
+    time.sleep(0.2)
 
-            # 1) Fall detection
-            label, fall = "NA", False
-            try:
-                label, fall = detector.process_frame(frame)
-                if fall:
-                    print("[ALERT] Fall detected!")
-                    # Example safety action: stop robot
-                    # car.Car_Stop()
-            except Exception as e:
-                print(f"[FallDet ERROR] {e}")
+    print("L/R check (left → right → both)...")
+    lr_check(660.0)
 
-            # 2) Tracking (if available)
-            try:
-                if tracker_obj is not None:
-                    if hasattr(tracker_obj, "update"):
-                        tracker_obj.update(frame)
-                    elif hasattr(tracker_obj, "process_frame"):
-                        tracker_obj.process_frame(frame)
-                    elif track_fn:
-                        track_fn(frame, car)
-                elif track_fn is not None:
-                    try:
-                        track_fn(frame, car)  # prefer passing car
-                    except TypeError:
-                        track_fn(frame)       # fallback
-            except Exception as e:
-                print(f"[Tracking ERROR] {e}")
-
-            # 3) Optional GUI window for debugging
-            if show_window:
-                try:
-                    cv2.putText(frame, str(label), (30, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.imshow("Robot Vision", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        stop_event.set()
-                        break
-                except cv2.error:
-                    # In headless environments, imshow may fail -> ignore
-                    pass
-
-            # Tiny sleep to avoid 100% CPU pegging
-            time.sleep(0.001)
-
-    finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-        if show_window:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
-        try:
-            cleanup()  # fall_det cleanup (should be idempotent)
-        except Exception as e:
-            print(f"[CLEANUP WARN] {e}")
-        try:
-            car.Car_Stop()  # ensure safe stop
-        except Exception:
-            pass
-        print("camera loop stopped")
-
+    print("Done.")
 
 if __name__ == "__main__":
-    # Shared stop signal across threads
-    stop_event = threading.Event()
-
-    # Single camera -> unified loop handles both fall detection & tracking
-    # cam_thread = threading.Thread(
-    #     target=unified_camera_loop,
-    #     kwargs={
-    #         "stop_event": stop_event,
-    #         "camera_index": 0,
-    #         "width": 640, "height": 480, "fps": 30,
-    #         "show_window": False  # set True when you connect a display or use VNC
-    #     },
-    #     daemon=True
-    # )
-    # cam_thread.start()
-
-    # Run chatbot on main thread (Ctrl+C responsive)
-    try:
-        chatbot_loop(stop_event)
-    except KeyboardInterrupt:
-        stop_event.set()
-    finally:
-        stop_event.set()
-        # try:
-        #     cam_thread.join(timeout=1.0)
-        # except RuntimeError:
-        #     pass
-        print("all threads stopped")
+    main()
