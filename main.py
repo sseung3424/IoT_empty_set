@@ -1,221 +1,109 @@
-# main.py
-from dotenv import load_dotenv
-load_dotenv()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CSI (ribbon) camera smoke test using Picamera2 + libcamera.
+Keys:
+  q : quit
+  s : save snapshot to ./captures/
+  r : start/stop recording to ./records/ (H.264 mp4)
+"""
 
-import cv2
-import threading
 import time
+import os
+from pathlib import Path
+import cv2
 
-from fall_det import FallDetector, cleanup
-from tts import text_to_speech
-from stt import speech_to_text
-from llm import ask_gemini
+from picamera2 import Picamera2, Preview
+from picamera2.encoders import H264Encoder
+from picamera2.outputs import FfmpegOutput
 
-# Robot control (motors/servo via I2C)
-from yb_car import YB_Pcb_Car
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-# Tracking module (interface can vary across your codebase)
-try:
-    import tracking as tracking_mod
-except Exception:
-    tracking_mod = None
+def overlay_fps(frame, fps, res_text):
+    text = f"{res_text} | FPS: {fps:4.1f}"
+    cv2.putText(frame, text, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-def init_tracker(car):
-    """
-    Try to initialize the tracking interface.
-    Supported patterns:
-      1) Class-based: tracking.PersonTracker([car]) with update(frame) or process_frame(frame)
-      2) Function-based: tracking.process_frame(frame, [car])
-    Returns: (tracker_obj, track_fn)
-    """
-    tracker_obj, track_fn = None, None
-    if tracking_mod:
-        if hasattr(tracking_mod, "PersonTracker"):
-            try:
-                tracker_obj = tracking_mod.PersonTracker(car=car)
-            except TypeError:
-                tracker_obj = tracking_mod.PersonTracker()
-        elif hasattr(tracking_mod, "process_frame"):
-            track_fn = tracking_mod.process_frame
-    return tracker_obj, track_fn
+def main():
+    snapshots_dir = Path("./captures"); ensure_dir(snapshots_dir)
+    records_dir   = Path("./records");  ensure_dir(records_dir)
 
+    picam = Picamera2()
 
-def chatbot_loop(stop_event: threading.Event):
-    """
-    Voice chatbot loop.
-    - STT for input
-    - LLM for response
-    - TTS for output
-    - Say 'exit' to stop everything
-    """
-    print("chatbot - say 'exit' to stop")
-    while not stop_event.is_set():
-        try:
-            user_msg = speech_to_text()
-        except Exception as e:
-            print(f"[STT ERROR] {e}")
-            time.sleep(0.2)
-            continue
+    # Configure a reasonable 1280x720 preview
+    preview_config = picam.create_preview_configuration(
+        main={"format": "RGB888", "size": (1280, 720)},
+        queue=True  # enable frame queueing for smoother capture
+    )
+    picam.configure(preview_config)
 
-        if not user_msg:
-            time.sleep(0.05)
-            continue
+    # Optional camera controls (uncomment / tweak as needed)
+    # picam.set_controls({"AeExposureMode": 0})  # 0=Normal, 3=Short, etc.
+    # picam.set_controls({"AfMode": 1})          # 1=Continuous, 2=Manual
+    # picam.set_controls({"AwbEnable": True})
 
-        print("user:", user_msg)
+    picam.start()
+    win = "CSI Camera Test (q=quit, s=snapshot, r=record)"
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
-        if user_msg.strip().lower() == "exit":
-            print("chatbot stops")
-            stop_event.set()
-            break
+    # Recording state
+    recording = False
+    encoder = None
+    ff_out = None
 
-        print("chatbot: thinking...")
-        try:
-            reply = ask_gemini(user_msg)  # should return a string
-        except Exception as e:
-            reply = f"[ERROR] LLM failed: {e}"
-
-        print("chatbot:\n" + (reply or ""))
-
-        if reply and not reply.startswith("[ERROR]"):
-            try:
-                text_to_speech(reply)
-            except Exception as e:
-                print(f"[TTS ERROR] {e}")
-
-
-def unified_camera_loop(stop_event: threading.Event,
-                        camera_index: int = 0,
-                        width: int = 640, height: int = 480, fps: int = 30,
-                        show_window: bool = False):
-    """
-    Unified camera loop:
-      - Single capture for both fall detection and tracking (no device conflicts)
-      - Optional GUI window via `show_window`
-      - Tracking is expected to command the robot through YB_Pcb_Car
-    """
-    car = YB_Pcb_Car()
-
-    tracker_obj, track_fn = init_tracker(car)
-    detector = FallDetector()
-
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        print(f"[ERROR] Camera {camera_index} open failed.")
-        return
-
-    # Reasonable performance settings for Raspberry Pi
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS,          fps)
-
-    time.sleep(0.5)  # warm-up
-
-    if tracking_mod is None:
-        print("[WARN] tracking module not found -> tracking disabled")
-    elif tracker_obj is None and track_fn is None:
-        print("[WARN] tracking interface not found -> tracking disabled")
-    else:
-        print("[INFO] tracking enabled")
+    last = time.time()
+    count = 0
+    fps = 0.0
 
     try:
-        while not stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok:
-                print("[WARN] Camera read failed; retrying...")
-                time.sleep(0.03)
-                continue
+        while True:
+            frame = picam.capture_array()  # ndarray in RGB888
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-            # 1) Fall detection
-            label, fall = "NA", False
-            try:
-                label, fall = detector.process_frame(frame)
-                if fall:
-                    print("[ALERT] Fall detected!")
-                    # Example safety action: stop robot
-                    # car.Car_Stop()
-            except Exception as e:
-                print(f"[FallDet ERROR] {e}")
+            # FPS
+            count += 1
+            now = time.time()
+            dt = now - last
+            if dt >= 0.5:
+                inst = count / dt
+                fps = 0.9 * fps + 0.1 * inst if fps else inst
+                count = 0
+                last = now
 
-            # 2) Tracking (if available)
-            try:
-                if tracker_obj is not None:
-                    if hasattr(tracker_obj, "update"):
-                        tracker_obj.update(frame)
-                    elif hasattr(tracker_obj, "process_frame"):
-                        tracker_obj.process_frame(frame)
-                    elif track_fn:
-                        track_fn(frame, car)
-                elif track_fn is not None:
-                    try:
-                        track_fn(frame, car)  # prefer passing car
-                    except TypeError:
-                        track_fn(frame)       # fallback
-            except Exception as e:
-                print(f"[Tracking ERROR] {e}")
+            h, w = frame.shape[:2]
+            overlay_fps(frame, fps, f"{w}x{h}")
+            cv2.imshow(win, frame)
+            key = cv2.waitKey(1) & 0xFF
 
-            # 3) Optional GUI window for debugging
-            if show_window:
-                try:
-                    cv2.putText(frame, str(label), (30, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.imshow("Robot Vision", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        stop_event.set()
-                        break
-                except cv2.error:
-                    # In headless environments, imshow may fail -> ignore
-                    pass
+            if key == ord('q'):
+                break
 
-            # Tiny sleep to avoid 100% CPU pegging
-            time.sleep(0.001)
+            elif key == ord('s'):
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                out = snapshots_dir / f"snapshot_{ts}.jpg"
+                cv2.imwrite(str(out), frame)
+                print(f"[SAVE] {out}")
 
+            elif key == ord('r'):
+                if not recording:
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    mp4_path = records_dir / f"record_{ts}.mp4"
+                    encoder = H264Encoder(bitrate=6_000_000)
+                    ff_out = FfmpegOutput(str(mp4_path))
+                    picam.start_recording(encoder, ff_out)
+                    recording = True
+                    print(f"[REC] start -> {mp4_path}")
+                else:
+                    picam.stop_recording()
+                    recording = False
+                    print("[REC] stop")
     finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-        if show_window:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
-        try:
-            cleanup()  # fall_det cleanup (should be idempotent)
-        except Exception as e:
-            print(f"[CLEANUP WARN] {e}")
-        try:
-            car.Car_Stop()  # ensure safe stop
-        except Exception:
-            pass
-        print("camera loop stopped")
-
+        if recording:
+            picam.stop_recording()
+        picam.stop()
+        cv2.destroyAllWindows()
+        print("Camera test ended.")
 
 if __name__ == "__main__":
-    # Shared stop signal across threads
-    stop_event = threading.Event()
-
-    # Single camera -> unified loop handles both fall detection & tracking
-    # cam_thread = threading.Thread(
-    #     target=unified_camera_loop,
-    #     kwargs={
-    #         "stop_event": stop_event,
-    #         "camera_index": 0,
-    #         "width": 640, "height": 480, "fps": 30,
-    #         "show_window": False  # set True when you connect a display or use VNC
-    #     },
-    #     daemon=True
-    # )
-    # cam_thread.start()
-
-    # Run chatbot on main thread (Ctrl+C responsive)
-    try:
-        chatbot_loop(stop_event)
-    except KeyboardInterrupt:
-        stop_event.set()
-    finally:
-        stop_event.set()
-        # try:
-        #     cam_thread.join(timeout=1.0)
-        # except RuntimeError:
-        #     pass
-        print("all threads stopped")
+    main()
