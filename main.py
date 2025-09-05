@@ -1,63 +1,56 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Speaker test (USB headset preferred).
-- Plays 440 Hz tone (1s) then L/R channel check (1.5s).
+Speaker test for USB audio device (AB13X USB Audio).
+- Plays a 440 Hz tone (1 s) then L/R channel check (0.5 s each, then both).
+- Uses hardware parameters: 48 kHz, stereo, 16-bit PCM.
 """
 
 import numpy as np
 import sounddevice as sd
 import time
 
-SAMPLE_RATE = 16000  # 16 kHz is enough for tests
+SAMPLE_RATE = 48000        # hardware-supported sample rate
+OUTPUT_DEV  = "hw:3,0"     # set to "plughw:3,0" if you prefer ALSA conversion
 
-def find_output_device():
-    """Pick an output device that looks like a USB headset if available."""
-    devices = sd.query_devices()
-    # Prefer devices that look like USB/Headset/Audio
-    for i, d in enumerate(devices):
-        name = d["name"].lower()
-        if d["max_output_channels"] > 0 and any(k in name for k in ["usb", "headset", "audio"]):
-            return i
-    # Fallback: first device with output channels
-    for i, d in enumerate(devices):
-        if d["max_output_channels"] > 0:
-            return i
-    return None
+# Configure sounddevice defaults to match the USB headset
+sd.default.samplerate = SAMPLE_RATE
+sd.default.channels   = 2            # stereo
+sd.default.dtype      = "int16"
+sd.default.device     = (None, OUTPUT_DEV)
 
-def play_tone(frequency=440.0, seconds=1.0):
-    """Play a mono sine tone to both channels."""
+def _to_int16(x: np.ndarray) -> np.ndarray:
+    """Convert float32 [-1, 1] to int16 PCM."""
+    return np.clip(x * 32767.0, -32768, 32767).astype(np.int16)
+
+def play_tone(frequency: float = 440.0, seconds: float = 1.0, gain: float = 0.2):
+    """Play a stereo sine tone (same signal on L/R)."""
     t = np.linspace(0, seconds, int(SAMPLE_RATE * seconds), endpoint=False)
-    tone = 0.2 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+    tone = gain * np.sin(2 * np.pi * frequency * t).astype(np.float32)
     stereo = np.stack([tone, tone], axis=1)
-    sd.play(stereo, SAMPLE_RATE, blocking=True)
+    sd.play(_to_int16(stereo), SAMPLE_RATE, blocking=True, device=OUTPUT_DEV)
 
-def lr_check(frequency=660.0):
-    """Play left-only, right-only, then both (0.5s each)."""
-    seg = int(0.5 * SAMPLE_RATE)
-    t = np.linspace(0, 0.5, seg, endpoint=False)
-    wave = 0.2 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+def lr_check(frequency: float = 660.0, seg_seconds: float = 0.5, gain: float = 0.2):
+    """Play left-only, right-only, then both (0.5 s each by default)."""
+    n = int(seg_seconds * SAMPLE_RATE)
+    t = np.linspace(0, seg_seconds, n, endpoint=False)
+    wave = (gain * np.sin(2 * np.pi * frequency * t)).astype(np.float32)
 
-    left = np.zeros((seg, 2), dtype=np.float32);  left[:, 0] = wave
-    right = np.zeros((seg, 2), dtype=np.float32); right[:, 1] = wave
-    both = np.stack([wave, wave], axis=1)
+    left  = np.stack([wave, np.zeros_like(wave)], axis=1)
+    right = np.stack([np.zeros_like(wave), wave], axis=1)
+    both  = np.stack([wave, wave], axis=1)
 
-    sd.play(np.concatenate([left, right, both], axis=0), SAMPLE_RATE, blocking=True)
+    seq = np.concatenate([left, right, both], axis=0)
+    sd.play(_to_int16(seq), SAMPLE_RATE, blocking=True, device=OUTPUT_DEV)
 
 def main():
-    out_idx = find_output_device()
-    if out_idx is not None:
-        sd.default.device = (None, out_idx)
-        print(f"[Output] Using device {out_idx}: {sd.query_devices(out_idx)['name']}")
-    else:
-        print("[Output] Using system default.")
-
-    print("Playing 440 Hz...")
+    print(f"[Output] Using device: {OUTPUT_DEV}")
+    print("Playing 440 Hz tone...")
     play_tone(440.0, 1.0)
     time.sleep(0.2)
 
     print("L/R check (left → right → both)...")
-    lr_check(660.0)
+    lr_check(660.0, 0.5)
 
     print("Done.")
 
