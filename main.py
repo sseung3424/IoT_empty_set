@@ -10,7 +10,7 @@ import numpy as np
 import sounddevice as sd
 import wave
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 8000
 DURATION = 5.0
 WAV_PATH = "recorded.wav"
 
