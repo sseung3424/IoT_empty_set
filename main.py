@@ -1,16 +1,30 @@
 import cv2
-cap = cv2.VideoCapture(0)             # 레거시 V4L2 장치
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS, 30)
+from picamera2 import Picamera2
+
+# Initialize the Raspberry Pi Camera
+picam2 = Picamera2()
+
+# Set resolution = 640x480, format = RGB888
+config = picam2.create_preview_configuration(
+    main={"size": (640, 480), "format": "RGB888"}
+)
+picam2.configure(config)
+
+# Start camera streaming
+picam2.start()
 
 while True:
-    ok, frame = cap.read()
-    if not ok:
-        print("캡처 실패"); break
-    cv2.imshow("camera", frame)
-    if cv2.waitKey(1) & 0xFF == 27:   # ESC 종료
+    # Capture one frame as numpy array
+    frame = picam2.capture_array()
+
+    # Show the frame in OpenCV window
+    cv2.imshow("rpicam", frame)
+
+    # Press ESC key to exit
+    if cv2.waitKey(1) & 0xFF == 27:
         break
 
-cap.release()
+# Stop the camera and close all windows
+picam2.stop()
 cv2.destroyAllWindows()
+
