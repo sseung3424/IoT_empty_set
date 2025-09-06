@@ -1,221 +1,189 @@
-# main.py
-from dotenv import load_dotenv
-load_dotenv()
+# pip install tflite-runtime opencv-python
+import os, time, cv2, numpy as np
+import tflite_runtime.interpreter as tflite
+from collections import deque
 
-import cv2
-import threading
-import time
+# ---------------- Camera config (Yahboom style) ----------------
+cap = cv2.VideoCapture(0)
+cap.set(3, 640)  # set Width
+cap.set(4, 480)  # set Height
 
-from fall_det import FallDetector, cleanup
-from tts import text_to_speech
-from stt import speech_to_text
-from llm import ask_gemini
+TEST_CAM_ONLY = False  # set True to test camera only (like Yahboom sample)
 
-# Robot control (motors/servo via I2C)
-from yb_car import YB_Pcb_Car
+if TEST_CAM_ONLY:
+    t_start = time.time()
+    fps = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        canny = cv2.Canny(frame, 50, 150)
 
-# Tracking module (interface can vary across your codebase)
-try:
-    import tracking as tracking_mod
-except Exception:
-    tracking_mod = None
+        fps += 1
+        mfps = fps / (time.time() - t_start + 1e-9)
+        cv2.putText(frame, "FPS " + str(int(mfps)), (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-def init_tracker(car):
-    """
-    Try to initialize the tracking interface.
-    Supported patterns:
-      1) Class-based: tracking.PersonTracker([car]) with update(frame) or process_frame(frame)
-      2) Function-based: tracking.process_frame(frame, [car])
-    Returns: (tracker_obj, track_fn)
-    """
-    tracker_obj, track_fn = None, None
-    if tracking_mod:
-        if hasattr(tracking_mod, "PersonTracker"):
-            try:
-                tracker_obj = tracking_mod.PersonTracker(car=car)
-            except TypeError:
-                tracker_obj = tracking_mod.PersonTracker()
-        elif hasattr(tracking_mod, "process_frame"):
-            track_fn = tracking_mod.process_frame
-    return tracker_obj, track_fn
+        cv2.imshow('frame', frame)
+        cv2.imshow('Canny', canny)
 
-
-def chatbot_loop(stop_event: threading.Event):
-    """
-    Voice chatbot loop.
-    - STT for input
-    - LLM for response
-    - TTS for output
-    - Say 'exit' to stop everything
-    """
-    print("chatbot - say 'exit' to stop")
-    while not stop_event.is_set():
-        try:
-            user_msg = speech_to_text()
-        except Exception as e:
-            print(f"[STT ERROR] {e}")
-            time.sleep(0.2)
-            continue
-
-        if not user_msg:
-            time.sleep(0.05)
-            continue
-
-        print("user:", user_msg)
-
-        if user_msg.strip().lower() == "exit":
-            print("chatbot stops")
-            stop_event.set()
+        k = cv2.waitKey(30) & 0xff
+        if k == 27:  # ESC
             break
 
-        print("chatbot: thinking...")
-        try:
-            reply = ask_gemini(user_msg)  # should return a string
-        except Exception as e:
-            reply = f"[ERROR] LLM failed: {e}"
+    cap.release()
+    cv2.destroyAllWindows()
+    raise SystemExit
 
-        print("chatbot:\n" + (reply or ""))
+# ---------------- TFLite MoveNet setup ----------------
+MODEL_PATH = "movenet_singlepose_lightning.tflite"  # put your tflite model here
+if not os.path.isfile(MODEL_PATH):
+    raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
 
-        if reply and not reply.startswith("[ERROR]"):
-            try:
-                text_to_speech(reply)
-            except Exception as e:
-                print(f"[TTS ERROR] {e}")
+interpreter = tflite.Interpreter(model_path=MODEL_PATH, num_threads=4)
+interpreter.allocate_tensors()
+in_details = interpreter.get_input_details()
+out_details = interpreter.get_output_details()
 
+# ---------------- Fall detection state ----------------
+HIST = 30
+centroid_hist = deque(maxlen=HIST)
+angle_hist = deque(maxlen=HIST)
+aspect_hist = deque(maxlen=HIST)
+ts_hist = deque(maxlen=HIST)
 
-def unified_camera_loop(stop_event: threading.Event,
-                        camera_index: int = 0,
-                        width: int = 640, height: int = 480, fps: int = 30,
-                        show_window: bool = False):
-    """
-    Unified camera loop:
-      - Single capture for both fall detection and tracking (no device conflicts)
-      - Optional GUI window via `show_window`
-      - Tracking is expected to command the robot through YB_Pcb_Car
-    """
-    car = YB_Pcb_Car()
+state = "Standing"
+fall_time = None
 
-    tracker_obj, track_fn = init_tracker(car)
-    detector = FallDetector()
+def preprocess(frame):
+    """Resize & normalize frame for MoveNet."""
+    ih, iw = frame.shape[:2]
+    inp = cv2.resize(frame, (256, 256))
+    inp = inp.astype(np.float32) / 255.0
+    inp = np.expand_dims(inp, axis=0)
+    return inp, (iw, ih)
 
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        print(f"[ERROR] Camera {camera_index} open failed.")
-        return
+def run_movenet(frame):
+    """Run MoveNet and return keypoints as (17, 3) => (x, y, score) in pixel coords."""
+    inp, (iw, ih) = preprocess(frame)
+    interpreter.set_tensor(in_details[0]['index'], inp)
+    interpreter.invoke()
+    kp = interpreter.get_tensor(out_details[0]['index'])
+    keypoints = []
+    for j in range(17):
+        y = kp[0, 0, j, 0] * ih
+        x = kp[0, 0, j, 1] * iw
+        s = kp[0, 0, j, 2]
+        keypoints.append((x, y, s))
+    return np.array(keypoints)
 
-    # Reasonable performance settings for Raspberry Pi
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS,          fps)
+def torso_angle_and_bbox(kp):
+    """Compute torso angle to vertical and bbox aspect ratio from confident keypoints."""
+    def pick(idx): return kp[idx][:2], kp[idx][2]
+    (ls, ls_s), (rs, rs_s) = pick(5), pick(6)
+    (lh, lh_s), (rh, rh_s) = pick(11), pick(12)
 
-    time.sleep(0.5)  # warm-up
-
-    if tracking_mod is None:
-        print("[WARN] tracking module not found -> tracking disabled")
-    elif tracker_obj is None and track_fn is None:
-        print("[WARN] tracking interface not found -> tracking disabled")
+    conf_ok = min(ls_s, rs_s, lh_s, rh_s) > 0.3
+    if conf_ok:
+        shoulder = (ls + rs) / 2
+        hip = (lh + rh) / 2
     else:
-        print("[INFO] tracking enabled")
+        (lk, lk_s), (rk, rk_s) = pick(13), pick(14)
+        shoulder = (lh + rh) / 2
+        if min(lk_s, rk_s) > 0.2:
+            hip = (lk + rk) / 2
+        else:
+            hip = shoulder
 
-    try:
-        while not stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok:
-                print("[WARN] Camera read failed; retrying...")
-                time.sleep(0.03)
-                continue
+    vec = hip - shoulder
+    v = vec / (np.linalg.norm(vec) + 1e-6)
+    cosang = v[1]  # dot with (0,1)
+    theta = np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0)))
 
-            # 1) Fall detection
-            label, fall = "NA", False
-            try:
-                label, fall = detector.process_frame(frame)
-                if fall:
-                    print("[ALERT] Fall detected!")
-                    # Example safety action: stop robot
-                    # car.Car_Stop()
-            except Exception as e:
-                print(f"[FallDet ERROR] {e}")
+    pts = np.array([p[:2] for p in kp if p[2] > 0.2])
+    if len(pts) >= 3:
+        x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+        aspect = h / (w + 1e-6)
+        cx, cy = x + w / 2, y + h / 2
+    else:
+        aspect, (cx, cy) = 1.0, (0.0, 0.0)
+    return theta, aspect, (cx, cy)
 
-            # 2) Tracking (if available)
-            try:
-                if tracker_obj is not None:
-                    if hasattr(tracker_obj, "update"):
-                        tracker_obj.update(frame)
-                    elif hasattr(tracker_obj, "process_frame"):
-                        tracker_obj.process_frame(frame)
-                    elif track_fn:
-                        track_fn(frame, car)
-                elif track_fn is not None:
-                    try:
-                        track_fn(frame, car)  # prefer passing car
-                    except TypeError:
-                        track_fn(frame)       # fallback
-            except Exception as e:
-                print(f"[Tracking ERROR] {e}")
+def update_state(theta, aspect, cy, tstamp, img_h=480):
+    """Finite state machine for fall detection with simple thresholds."""
+    global state, fall_time
 
-            # 3) Optional GUI window for debugging
-            if show_window:
-                try:
-                    cv2.putText(frame, str(label), (30, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.imshow("Robot Vision", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        stop_event.set()
-                        break
-                except cv2.error:
-                    # In headless environments, imshow may fail -> ignore
-                    pass
+    angle_hist.append(theta)
+    aspect_hist.append(aspect)
+    centroid_hist.append(cy)
+    ts_hist.append(tstamp)
 
-            # Tiny sleep to avoid 100% CPU pegging
-            time.sleep(0.001)
+    if len(centroid_hist) >= 3:
+        dt = ts_hist[-1] - ts_hist[-3]
+        vy = (centroid_hist[-1] - centroid_hist[-3]) / dt if dt > 0 else 0.0
+    else:
+        vy = 0.0
 
-    finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-        if show_window:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
-        try:
-            cleanup()  # fall_det cleanup (should be idempotent)
-        except Exception as e:
-            print(f"[CLEANUP WARN] {e}")
-        try:
-            car.Car_Stop()  # ensure safe stop
-        except Exception:
-            pass
-        print("camera loop stopped")
+    ANG = theta > 60.0
+    FLAT = aspect < 0.6
+    FAST = abs(vy) > 0.6 * img_h  # pixels/sec threshold
+    STILL = False
+    if len(ts_hist) >= 5:
+        dur = ts_hist[-1] - ts_hist[0]
+        if dur >= 1.8:
+            dy = max(centroid_hist) - min(centroid_hist)
+            STILL = dy < 0.02 * img_h  # <2% of image height
 
+    if state == "Standing":
+        if ANG and FAST:
+            state = "Suspicious"
+            fall_time = tstamp
+    elif state == "Suspicious":
+        if (ANG and FLAT) and STILL and (tstamp - fall_time >= 2.0):
+            state = "Fallen"
+        elif not ANG and not FAST:
+            state = "Standing"
+    elif state == "Fallen":
+        if (not ANG) and aspect > 0.9 and (not STILL):
+            state = "Standing"
+    return state
 
-if __name__ == "__main__":
-    # Shared stop signal across threads
-    stop_event = threading.Event()
+# ---------------- Main loop (Yahboom-style HUD/FPS/ESC) ----------------
+t_start = time.time()
+fps = 0
 
-    # Single camera -> unified loop handles both fall detection & tracking
-    # cam_thread = threading.Thread(
-    #     target=unified_camera_loop,
-    #     kwargs={
-    #         "stop_event": stop_event,
-    #         "camera_index": 0,
-    #         "width": 640, "height": 480, "fps": 30,
-    #         "show_window": False  # set True when you connect a display or use VNC
-    #     },
-    #     daemon=True
-    # )
-    # cam_thread.start()
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-    # Run chatbot on main thread (Ctrl+C responsive)
-    try:
-        chatbot_loop(stop_event)
-    except KeyboardInterrupt:
-        stop_event.set()
-    finally:
-        stop_event.set()
-        # try:
-        #     cam_thread.join(timeout=1.0)
-        # except RuntimeError:
-        #     pass
-        print("all threads stopped")
+    t0 = time.time()
+    kps = run_movenet(frame)
+    theta, aspect, (cx, cy) = torso_angle_and_bbox(kps)
+    cur_state = update_state(theta, aspect, cy, t0, img_h=int(cap.get(4) or 480))
+
+    # Optional: draw minimal bbox from keypoints for visualization
+    pts = np.array([p[:2] for p in kps if p[2] > 0.2])
+    if len(pts) >= 3:
+        x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    # FPS text (same style as Yahboom)
+    fps += 1
+    mfps = fps / (time.time() - t_start + 1e-9)
+    cv2.putText(frame, "FPS " + str(int(mfps)), (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    # State HUD
+    cv2.putText(frame, f"state={cur_state}  theta={theta:.1f}  r(h/w)={aspect:.2f}",
+                (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+    cv2.imshow('frame', frame)
+
+    k = cv2.waitKey(30) & 0xff
+    if k == 27:  # press 'ESC' to quit
+        break
+
+cap.release()
+cv2.destroyAllWindows()
