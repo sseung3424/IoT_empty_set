@@ -1,77 +1,95 @@
 # stt.py
 from google.cloud import speech
-import pyaudio
+import sounddevice as sd
 import queue
 import threading
 
+# ====== Audio I/O config (match your working test) ======
+SAMPLE_RATE = 48000          # USB device supports 48 kHz
+CHANNELS = 1                 # mono
+DTYPE = "int16"              # LINEAR16 expected by Google STT
+BLOCK_MS = 100               # ~100 ms per chunk
+BLOCK_FRAMES = int(SAMPLE_RATE * BLOCK_MS / 1000)
+
+# Choose your input device: ALSA name like "hw:3,0" (as in your test) or an index/int.
+INPUT_DEVICE = "hw:3,0"      # set to your USB mic device (or an integer index)
+
+# ====== Google STT client ======
 stt_client = speech.SpeechClient()
 
-RATE = 44100
-CHUNK = int(RATE / 10)
-MIC_INDEX = 3  # None - basic mic, configure index for selecting USB mic
-
-def stream_generator(q):
+def _request_generator(q: "queue.Queue[bytes]"):
+    """Yield StreamingRecognizeRequest objects from an audio-bytes queue."""
     while True:
         chunk = q.get()
-        if chunk is None:
+        if chunk is None:  # sentinel -> stop
             return
         yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-def speech_to_text():
-    audio_interface = pyaudio.PyAudio()
-    audio_stream = audio_interface.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=RATE,
-        input=True,
-        input_device_index=MIC_INDEX,  # select USB mic
-        frames_per_buffer=CHUNK,
-    )
+def speech_to_text() -> str:
+    """
+    Capture microphone via sounddevice and stream to Google Cloud STT.
+    Stops on the first final result and returns recognized text.
+    """
+    audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=20)
+    stop_event = threading.Event()
 
-    q = queue.Queue()
+    # Configure sounddevice defaults (optional)
+    sd.default.samplerate = SAMPLE_RATE
+    sd.default.channels = CHANNELS
+    sd.default.dtype = DTYPE
 
-    config = speech.RecognitionConfig(
+    # Audio callback pushes raw int16 bytes into the queue
+    def audio_callback(indata, frames, time, status):
+        # status handling is intentionally minimal; print but keep streaming
+        if status:
+            print("[AudioStatus]", status)
+        try:
+            audio_q.put_nowait(indata.tobytes())
+        except queue.Full:
+            # drop if the recognizer is slower than input (prevents unbounded growth)
+            pass
+
+    # Build Google STT configs
+    recog_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=RATE,
+        sample_rate_hertz=SAMPLE_RATE,
         language_code="ko-KR",
+        enable_automatic_punctuation=True,
     )
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=config,
-        interim_results=False
+    stream_config = speech.StreamingRecognitionConfig(
+        config=recog_config,
+        interim_results=False,   # return only final results
+        single_utterance=True,   # end after a spoken phrase
     )
-
-    def fill_buffer():
-        while True:
-            try:
-                data = audio_stream.read(CHUNK, exception_on_overflow=False)
-                q.put(data)
-            except Exception as e:
-                print("[ERROR] Mic read:", e)
-                break
-
-    threading.Thread(target=fill_buffer, daemon=True).start()
-
-    requests = stream_generator(q)
-    responses = stt_client.streaming_recognize(streaming_config, requests)
 
     print("Listening...")
-
     final_text = ""
-    try:
-        for response in responses:
-            for result in response.results:
-                if result.is_final:
-                    final_text = result.alternatives[0].transcript
-                    q.put(None)
-                    audio_stream.stop_stream()
-                    audio_stream.close()
-                    audio_interface.terminate()
-                    print("Recognized:", final_text)
-                    return final_text
-    except Exception as e:
-        print("[ERROR] STT:", e)
-        q.put(None)
-        audio_stream.stop_stream()
-        audio_stream.close()
-        audio_interface.terminate()
-        return ""
+
+    # Open input stream with fixed blocksize for stable chunking
+    with sd.InputStream(device=INPUT_DEVICE,
+                        samplerate=SAMPLE_RATE,
+                        channels=CHANNELS,
+                        dtype=DTYPE,
+                        blocksize=BLOCK_FRAMES,
+                        callback=audio_callback):
+        # Start streaming to Google
+        requests = _request_generator(audio_q)
+        responses = stt_client.streaming_recognize(stream_config, requests)
+
+        try:
+            for response in responses:
+                for result in response.results:
+                    if result.is_final:
+                        final_text = result.alternatives[0].transcript
+                        print("Recognized:", final_text)
+                        stop_event.set()
+                        break
+                if stop_event.is_set():
+                    break
+        except Exception as e:
+            print("[ERROR] STT:", e)
+        finally:
+            # stop generator/stream by sending sentinel
+            audio_q.put(None)
+
+    return final_text
