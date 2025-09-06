@@ -2,6 +2,8 @@
 import os
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # Import local modules
 from stt import speech_to_text
 from tts import text_to_speech
@@ -9,7 +11,6 @@ from llm import ask_gemini
 
 def main():
     # Load environment variables (.env must contain GEMINI_API_KEY)
-    load_dotenv()
 
     print("=== Voice Chatbot (STT → LLM → TTS) ===")
 
