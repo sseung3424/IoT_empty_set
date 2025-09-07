@@ -30,9 +30,9 @@ CONF_THRESH = 0.30
 TARGET_LABEL = "person"
 
 # Wheel drive tuning (Yahboom typical 0~255)
-BASE_SPEED = 35
-MAX_SPEED  = 60
-MIN_SPEED  = 24
+BASE_SPEED = 60
+MAX_SPEED  = 100
+MIN_SPEED  = 40
 
 # Turning sensitivity: differential = int(Kx * x_dev)
 Kx = 280.0
@@ -143,7 +143,7 @@ class Follower:
         if abs(x_dev) < CENTER_DEADZONE:
             delta = 0
         else:
-            delta = int(Kx * x_dev)
+            delta = -int(Kx * x_dev)
 
         l = self._clamp(BASE_SPEED + delta, MIN_SPEED, MAX_SPEED)
         r = self._clamp(BASE_SPEED - delta, MIN_SPEED, MAX_SPEED)
