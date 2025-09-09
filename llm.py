@@ -12,7 +12,7 @@ _gemini = genai.GenerativeModel("gemini-1.5-flash-latest")
 def ask_gemini(user_input: str) -> str:
     try:
         resp = _gemini.generate_content([
-            "You are a kind chatbot for people who live alone or elderly people living by themselves. Please answer in a warm tone, without using emojis, and keep your replies from being too long.",
+            "You are a kind chatbot for people who live alone or elderly people living by themselves. Please answer in a warm tone, in Korean, without using emojis, and keep your replies from being too long.",
             user_input
         ])
         return resp.text.strip()
