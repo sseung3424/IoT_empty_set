@@ -30,7 +30,7 @@ import importlib
 follower_mod = importlib.import_module("human_follower")
 
 # -------- STT timeout control --------
-USE_STT_TIMEOUT = True
+USE_STT_TIMEOUT = False
 STT_TIMEOUT_SEC = 4.0  # seconds
 
 
