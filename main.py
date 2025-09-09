@@ -1,18 +1,19 @@
 # main.py
 # -*- coding: utf-8 -*-
 """
-Run two loops concurrently:
-1) Voice chatbot: STT -> LLM -> TTS
-2) Person follower: human_follower.main()
+Run two loops concurrently with a GUI-safe structure:
+1) Voice chatbot: STT -> LLM -> TTS  (worker thread)
+2) Person follower: human_follower.main()  (MAIN thread for OpenCV GUI)
 
 - Uses a shared stop_event for graceful shutdown.
-- Monkey-patches cv2.waitKey in the follower thread so it exits cleanly
-  when stop_event is set (simulates ESC key).
+- Patches cv2.waitKey in the follower (MAIN) so it exits cleanly when stop_event is set.
+- Adds an STT timeout wrapper to avoid long blocking on mic input.
 """
 
 import os
-import threading
 import time
+import threading
+import queue
 from dotenv import load_dotenv
 
 # -------- Load environment (.env must contain GEMINI_API_KEY) --------
@@ -29,16 +30,44 @@ import cv2
 import importlib
 follower_mod = importlib.import_module("human_follower")
 
+# -------- STT timeout control --------
+USE_STT_TIMEOUT = True
+STT_TIMEOUT_SEC = 4.0  # seconds
+
+
+def stt_with_timeout(timeout_sec: float) -> str | None:
+    """
+    Run speech_to_text() in a small worker thread and return within timeout_sec.
+    Returns None on timeout or any STT error to keep the loop responsive.
+    """
+    q: "queue.Queue[str | None]" = queue.Queue(maxsize=1)
+
+    def _run():
+        try:
+            q.put(speech_to_text())
+        except Exception:
+            q.put(None)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    try:
+        return q.get(timeout=timeout_sec)
+    except queue.Empty:
+        return None
+
 
 def voice_chatbot_loop(stop_event: threading.Event):
     """STT -> LLM -> TTS loop (cooperates with stop_event)."""
     print("=== Voice Chatbot (STT → LLM → TTS) ===")
     while not stop_event.is_set():
-        # 1) STT
-        user_text = speech_to_text()
+        # 1) STT (with optional timeout to prevent long blocking)
+        if USE_STT_TIMEOUT:
+            user_text = stt_with_timeout(STT_TIMEOUT_SEC)
+        else:
+            user_text = speech_to_text()
+
         if not user_text:
-            print("[INFO] No speech detected. Try again.")
-            # Small sleep to avoid tight loop on mic errors
+            # No speech / timeout / error -> keep loop responsive
             time.sleep(0.2)
             continue
 
@@ -46,7 +75,7 @@ def voice_chatbot_loop(stop_event: threading.Event):
 
         # Exit keywords from user voice
         if user_text.strip().lower() in ("exit", "quit", "stop"):
-            print("[INFO] Exit requested by user. Shutting down all loops...")
+            print("[INFO] Exit requested by user. Shutting down...")
             stop_event.set()
             break
 
@@ -55,7 +84,10 @@ def voice_chatbot_loop(stop_event: threading.Event):
         print(f"[Gemini] {response}")
 
         # 3) TTS
-        text_to_speech(response)
+        try:
+            text_to_speech(response)
+        except Exception as e:
+            print(f"[TTS] Error: {e}")
 
     print("[Voice] Loop ended.")
 
@@ -76,56 +108,50 @@ def _make_patched_waitKey(stop_event: threading.Event):
     return patched_waitKey
 
 
-def follower_loop(stop_event: threading.Event):
-    """Run human_follower.main() with cv2.waitKey patched for cooperative exit."""
-    print("=== Follower Thread (human_follower) ===")
-    # Patch cv2.waitKey in this thread's context
+def run_follower_in_main(stop_event: threading.Event):
+    """
+    Run human_follower.main() on the MAIN thread (GUI-safe).
+    We patch cv2.waitKey so that when stop_event is set, follower exits cleanly.
+    """
+    print("=== Follower (human_follower) on MAIN thread ===")
     patched = _make_patched_waitKey(stop_event)
     orig_waitKey = cv2.waitKey
     cv2.waitKey = patched
     try:
-        # Run the follower main loop (blocks until ESC or error)
-        follower_mod.main()
+        follower_mod.main()  # follower's loop should call imshow + waitKey(1)
     except Exception as e:
         print(f"[Follower] Error: {e}")
     finally:
-        # Restore original waitKey to avoid side effects
         cv2.waitKey = orig_waitKey
         print("[Follower] Loop ended.")
 
 
 def main():
-    print("=== Multi-Runner: Chatbot + Follower ===")
+    print("=== Multi-Runner: Chatbot (thread) + Follower (MAIN) ===")
     print("Tips:")
     print(" - Say 'exit' / 'quit' / 'stop' (via mic) to end both loops.")
     print(" - Or press Ctrl+C in the terminal.\n")
 
     stop_event = threading.Event()
 
-    # Start follower first (camera/motors), then voice bot (mic/speaker)
-    t_follower = threading.Thread(target=follower_loop, args=(stop_event,), daemon=True)
-    t_voice    = threading.Thread(target=voice_chatbot_loop, args=(stop_event,), daemon=True)
-
-    t_follower.start()
+    # Start voice chatbot as a background thread
+    t_voice = threading.Thread(target=voice_chatbot_loop, args=(stop_event,), daemon=True)
     t_voice.start()
 
     try:
-        # Wait for either thread to finish; keep main alive
-        while t_follower.is_alive() or t_voice.is_alive():
-            time.sleep(0.3)
-            if stop_event.is_set():
-                break
+        # Run follower (camera/GUI) on MAIN thread for HighGUI/Qt safety
+        run_follower_in_main(stop_event)
     except KeyboardInterrupt:
         print("\n[MAIN] KeyboardInterrupt. Stopping...")
         stop_event.set()
     finally:
-        # Give threads a moment to exit gracefully
-        for _ in range(30):
-            if not (t_follower.is_alive() or t_voice.is_alive()):
+        # Give voice thread a moment to exit gracefully
+        for _ in range(50):
+            if not t_voice.is_alive():
                 break
             time.sleep(0.1)
-
         print("[MAIN] All done. Bye.")
+
 
 if __name__ == "__main__":
     main()
