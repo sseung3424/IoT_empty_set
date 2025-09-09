@@ -1,4 +1,4 @@
-# follow_person_final.py
+# fall_det.py
 import os
 import time
 import numpy as np
