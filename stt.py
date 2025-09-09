@@ -11,6 +11,9 @@ DTYPE       = "int16"
 BLOCK_MS    = 100
 BLOCK_FRAMES= int(SAMPLE_RATE * BLOCK_MS / 1000)
 
+# ★ 여기만 환경에 맞게 조정
+INPUT_DEVICE = "hw:3,0"   # 필요시 "plughw:3,0" 도 시도 가능
+
 # ====== Google STT client ======
 stt_client = speech.SpeechClient()
 
@@ -75,7 +78,7 @@ def speech_to_text() -> str:
             pass
 
     # ========== 1) Streaming 먼저 시도 ==========
-    print("[STT] Listening... (streaming)")
+    print(f"[STT] Listening... (streaming, device={INPUT_DEVICE})")
     recog_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
@@ -93,6 +96,7 @@ def speech_to_text() -> str:
 
     try:
         with sd.InputStream(
+            device=INPUT_DEVICE,                  # ★★★ 강제 지정
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype=DTYPE,
@@ -128,8 +132,11 @@ def speech_to_text() -> str:
 
     # ========== 2) Fallback: 3초 버퍼 녹음 후 동기식 인식 ==========
     print("[STT] fallback record 3s...")
-    # 3초 녹음
-    rec = sd.rec(int(SAMPLE_RATE * 3), samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE)
+    rec = sd.rec(int(SAMPLE_RATE * 3),
+                 samplerate=SAMPLE_RATE,
+                 channels=CHANNELS,
+                 dtype=DTYPE,
+                 device=INPUT_DEVICE)              # ★★★ 폴백도 같은 장치로
     sd.wait()
     pcm = rec.tobytes()
     return _recognize_sync(pcm, SAMPLE_RATE)
