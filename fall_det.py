@@ -1,201 +1,230 @@
-# fall_det.py
-import os
-import time
-import numpy as np
+# fall_detection.py
+import os, time
 import cv2
+import numpy as np
+from ultralytics import YOLO
 from picamera2 import Picamera2
-from YB_Pcb_Car import YB_Pcb_Car
-from tflite_runtime.interpreter import Interpreter # tflite import 추가
 
-# ---------------------- TFLite helpers (CPU) ----------------------
-def load_labels(path):
-    labels = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            pair = line.strip().split(maxsplit=1)
-            if len(pair) == 2:
-                idx, name = pair
-                labels[int(idx)] = name
-    return labels
+# ====== 환경/튜닝 ======
+USE_DISPLAY = bool(int(os.environ.get("USE_DISPLAY", "1")))  # 0이면 창 미표시
+CONF_THRES  = float(os.environ.get("CONF_THRES", "0.30"))
+IMG_SIZE    = int(os.environ.get("IMG_SIZE", "320"))   # 256~384 권장
+FRAME_SKIP  = int(os.environ.get("FRAME_SKIP", "2"))   # N프레임 중 1프레임만 추론
+MODEL_PATH  = os.environ.get("MODEL_PATH", "yolov8n-pose.pt")
 
-def make_interpreter_cpu(model_path):
-    return Interpreter(model_path=model_path)
+# 속도·자세 임계(윈도우 버전과 동일 로직)
+MIN_ELAPSED_TIME_THRESHOLD = 5
+VEL_MARGIN = 80.0
 
-def set_input_tensor(interpreter, image_rgb):
-    input_details = interpreter.get_input_details()[0]
-    h, w = input_details["shape"][1], input_details["shape"][2]
-    resized = cv2.resize(image_rgb, (w, h))
-    if input_details["dtype"] == np.float32:
-        resized = resized.astype(np.float32) / 255.0
-    else:
-        resized = resized.astype(np.uint8)
-    interpreter.set_tensor(input_details["index"], np.expand_dims(resized, axis=0))
+# ====== 상태 ======
+previous_y_values = None
+first_vel_threshold = None
+second_vel_threshold = None
+falling_threshold = None
 
-def get_output(interpreter, conf_thresh=0.3):
-    output_details = interpreter.get_output_details()
-    boxes   = interpreter.get_tensor(output_details[0]["index"])[0]
-    classes = interpreter.get_tensor(output_details[1]["index"])[0].astype(np.int32)
-    scores  = interpreter.get_tensor(output_details[2]["index"])[0]
-    count   = int(interpreter.get_tensor(output_details[3]["index"])[0])
-    results = []
-    for i in range(count):
-        if scores[i] < conf_thresh:
-            continue
-        ymin, xmin, ymax, xmax = boxes[i]
-        results.append({
-            "bbox": (float(xmin), float(ymin), float(xmax), float(ymax)),
-            "score": float(scores[i]),
-            "class_id": int(classes[i]),
-        })
-    return results
-# ------------------------------------------------------------------
+fallen_state = False
+taking_video = False
+fall_start_time = None
+fall_alerted = False
 
-# ---------------------- Config ----------------------
-MODEL_DIR   = "./models"
-MODEL_CPU   = "mobilenet_ssd_v2_coco_quant_postprocess.tflite"
-LABELS_TXT  = "coco_labels.txt"
-CONF_THRESH = 0.40
-TARGET_LABEL = "person"
+# ====== 유틸 ======
+def _reset_detection_state():
+    global previous_y_values, fallen_state, taking_video, fall_start_time, fall_alerted
+    previous_y_values = None
+    fallen_state = False
+    taking_video = False
+    fall_start_time = None
+    fall_alerted = False
+    print("[state] 초기화 완료")
 
-BASE_SPEED = 100
-MAX_SPEED  = 120
-MIN_SPEED  = 60
-Kx = 200.0
-CENTER_DEADZONE = 0.10
-STOP_NEAR_Y     = 0.90
+def frame_coordinates(result):
+    """첫 번째 인물의 keypoint y좌표 배열(NaN 포함)."""
+    if result.keypoints is None or result.keypoints.xy is None or result.keypoints.xy.shape[0] == 0:
+        return None
+    kp_xy = result.keypoints.xy[0].cpu().numpy()
+    y = kp_xy[:, 1].astype(float)
+    if getattr(result.keypoints, "conf", None) is not None:
+        conf = result.keypoints.conf[0].cpu().numpy()
+        y[conf <= 0] = np.nan
+    y[y == 0.0] = np.nan
+    return y
 
-PAN_ID = 0
-TILT_ID = 1
-PAN_CENTER  = 90
-TILT_CENTER = 90
-PAN_GAIN    = 150.0
-TILT_GAIN   = 120.0
-PAN_SMOOTH  = 0.20
-TILT_SMOOTH = 0.30
-PAN_MIN, PAN_MAX   = 0, 180
-TILT_MIN, TILT_MAX = 45, 90
+def valid_count(arr):
+    if arr is None: return 0
+    return int(np.count_nonzero(~np.isnan(arr)))
 
-LOST_TIMEOUT = 3.0
-SEARCH_SPEED = 50
-# ----------------------------------------------------
+def nan_range(arr):
+    if arr is None or valid_count(arr) == 0: return 0.0
+    return float(np.nanmax(arr) - np.nanmin(arr))
 
-class Follower:
-    def __init__(self, car: YB_Pcb_Car):
-        self.car = car
-        self.pan = PAN_CENTER
-        self.tilt = TILT_CENTER
-        self.state = "SEARCHING"
-        self.last_seen_ts = 0.0
-        try:
-            self.car.Ctrl_Servo(PAN_ID, self.pan)
-            self.car.Ctrl_Servo(TILT_ID, self.tilt)
-        except Exception as e:
-            print("Servo init failed:", e)
+def velocity_from_prev(prev_y, curr_y, fps):
+    return (curr_y - prev_y) * float(fps)
 
-    @staticmethod
-    def _clamp(v, lo, hi):
-        return max(lo, min(hi, v))
+def init_thresholds_from_two_frames(res1, res2, fps_used):
+    """두 프레임으로 자세/속도 임계 계산."""
+    global falling_threshold, first_vel_threshold, second_vel_threshold
+    y1 = frame_coordinates(res1)
+    y2 = frame_coordinates(res2)
+    if valid_count(y1) < 6 or valid_count(y2) < 6:
+        return False
+    falling_threshold = (nan_range(y1) * 2.0 / 3.0) + 20.0
+    v12 = velocity_from_prev(y1, y2, fps_used)
+    v0 = v12[0] if not np.isnan(v12[0]) else 0.0
+    v5 = v12[5] if not np.isnan(v12[5]) else 0.0
+    first_vel_threshold  = abs(v0) + VEL_MARGIN
+    second_vel_threshold = abs(v5) + VEL_MARGIN
+    print(f"[init] falling={falling_threshold:.1f}, v0_thr={first_vel_threshold:.1f}, v5_thr={second_vel_threshold:.1f}")
+    return True
 
-    def stop(self):
-        self.car.Car_Stop()
+def check_falling_time_common():
+    global fall_start_time, fall_alerted, taking_video, fallen_state
+    if fall_start_time is None: return
+    if (time.time() - fall_start_time) >= MIN_ELAPSED_TIME_THRESHOLD:
+        print("[fall] ALERT! duration >= threshold")
+        fall_alerted = True
+        taking_video = True
+        fall_start_time = None
+        fallen_state = False
 
-    def drive_wheels(self, x_dev, y_max):
-        if y_max > STOP_NEAR_Y:
-            self.stop()
-            return "Stop"
-        if abs(x_dev) < CENTER_DEADZONE:
-            delta = 0
+def check_falling(y_values, fps_used, on_fall=None, announce_flag=None):
+    """윈도우에서 쓰던 속도·자세 기반 FSM."""
+    global previous_y_values, fallen_state, fall_start_time, fall_alerted
+    global first_vel_threshold, second_vel_threshold, falling_threshold
+
+    if previous_y_values is not None and valid_count(y_values) >= 6 and valid_count(previous_y_values) >= 6:
+        v_curr = velocity_from_prev(previous_y_values, y_values, fps_used)
+        first_speed  = abs(v_curr[0]) if not np.isnan(v_curr[0]) else 0.0
+        second_speed = abs(v_curr[5]) if not np.isnan(v_curr[5]) else 0.0
+        range_y = nan_range(y_values)
+
+        if (falling_threshold is not None) and (range_y <= falling_threshold):
+            if (first_vel_threshold is not None) and (second_vel_threshold is not None) and \
+               (first_speed <= first_vel_threshold) and (second_speed <= second_vel_threshold):
+                if fallen_state:
+                    check_falling_time_common()
+            else:
+                if not fallen_state:
+                    fallen_state = True
+                    fall_start_time = time.time()
+                    print("[fall] start (velocity-based)")
+                    if on_fall and announce_flag is not None and not announce_flag.get("done", False):
+                        try:
+                            result = on_fall()
+                            if result == "OK":
+                                _reset_detection_state()
+                            else:
+                                announce_flag["done"] = True
+                        except Exception as e:
+                            print(f"[on_fall] 오류: {e}")
+                            announce_flag["done"] = True
+                else:
+                    check_falling_time_common()
         else:
-            delta = int(Kx * x_dev)
-        
-        l = self._clamp(BASE_SPEED - delta, MIN_SPEED, MAX_SPEED)
-        r = self._clamp(BASE_SPEED + delta, MIN_SPEED, MAX_SPEED)
-        self.car.Car_Run(l, r)
-        
-        if delta > 10: return f"Forward-R({r})"
-        elif delta < -10: return f"Forward-L({l})"
-        else: return "Forward"
+            if fall_alerted:
+                pass
+            else:
+                fallen_state = False
+            if announce_flag is not None:
+                announce_flag["done"] = False
+            fall_start_time = None
 
-    def aim_servos(self, x_center, y_center):
-        pan_target  = PAN_CENTER + (0.5 - x_center) * PAN_GAIN
-        tilt_target = TILT_CENTER - (y_center - 0.5) * TILT_GAIN
-        self.pan  = (1 - PAN_SMOOTH)  * pan_target  + PAN_SMOOTH  * self.pan
-        self.tilt = (1 - TILT_SMOOTH) * tilt_target + TILT_SMOOTH * self.tilt
-        pan_cmd  = int(self._clamp(round(self.pan),  PAN_MIN,  PAN_MAX))
-        tilt_cmd = int(self._clamp(round(self.tilt), TILT_MIN, TILT_MAX))
-        try:
-            self.car.Ctrl_Servo(PAN_ID, pan_cmd)
-            self.car.Ctrl_Servo(TILT_ID, tilt_cmd)
-        except Exception as e:
-            print("Servo write failed:", e)
-        return pan_cmd, tilt_cmd
+    previous_y_values = y_values
 
-def main():
-    labels = load_labels(os.path.join(MODEL_DIR, LABELS_TXT))
-    interpreter = make_interpreter_cpu(os.path.join(MODEL_DIR, MODEL_CPU))
-    interpreter.allocate_tensors()
-    car = YB_Pcb_Car()
-    follow = Follower(car)
+# ====== Picamera2 열기 / 루프 ======
+def _open_picam2(width=640, height=480):
     picam2 = Picamera2()
-    config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+    config = picam2.create_preview_configuration(
+        main={"size": (int(width), int(height)), "format": "RGB888"}
+    )
     picam2.configure(config)
     picam2.start()
-    time.sleep(0.5)
-    WINDOW = "Follower"
+    return picam2
 
+def run_detection(on_fall=None):
+    """Picamera2에서 프레임을 받아 실시간 감지."""
+    global falling_threshold, first_vel_threshold, second_vel_threshold
+
+    # 카메라 & FPS
+    WIDTH, HEIGHT = 640, 480
+    picam2 = _open_picam2(WIDTH, HEIGHT)
+
+    # FPS 추정: 첫 30프레임에서 실측(초간단)
+    print("[cam] warming up & measuring FPS...")
+    t0 = time.time(); cnt = 0
+    while cnt < 30:
+        _ = picam2.capture_array()
+        cnt += 1
+    fps_used = max(10.0, 30.0/(time.time() - t0))  # 대략값
+    print(f"[cam] estimated FPS ≈ {fps_used:.1f}")
+
+    # 모델
+    model = YOLO(MODEL_PATH)
+
+    if USE_DISPLAY:
+        cv2.namedWindow("Video Feed", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Video Feed", 960, 540)
+
+    # ===== 부트스트랩: 유효 프레임 2장으로 임계값 =====
+    res_first, res_second = None, None
+    for _ in range(200):  # 최댓값 제한
+        frame = picam2.capture_array()  # RGB888
+        res = model.predict(frame, conf=CONF_THRES, imgsz=IMG_SIZE, verbose=False)[0]
+        yvals = frame_coordinates(res)
+        if valid_count(yvals) >= 6:
+            if res_first is None:
+                res_first = res
+            else:
+                res_second = res
+                if init_thresholds_from_two_frames(res_first, res_second, fps_used):
+                    break
+                else:
+                    res_first, res_second = res_second, None
+        if USE_DISPLAY:
+            cv2.imshow("Video Feed", res.plot())
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                picam2.stop(); cv2.destroyAllWindows(); return
+
+    # 기본 임계값(혹시 못 잡았을 때)
+    if falling_threshold is None:   falling_threshold = 400.0
+    if first_vel_threshold is None: first_vel_threshold = 120.0
+    if second_vel_threshold is None:second_vel_threshold = 120.0
+    print(f"[init-check] fall_thr={falling_threshold:.1f}, v0_thr={first_vel_threshold:.1f}, v5_thr={second_vel_threshold:.1f}, fps≈{fps_used:.1f}, imgsz={IMG_SIZE}, skip={FRAME_SKIP}")
+
+    # ===== 본 루프 =====
+    announce_flag = {"done": False}
+    frame_idx = 0
     try:
         while True:
-            rgb = picam2.capture_array()
-            h, w, _ = rgb.shape
-            set_input_tensor(interpreter, rgb)
-            interpreter.invoke()
-            detections = get_output(interpreter, CONF_THRESH)
-            best = max([d for d in detections if labels.get(d["class_id"]) == TARGET_LABEL], 
-                       key=lambda x: x["score"], default=None)
+            frame = picam2.capture_array()  # RGB888
+            frame_idx += 1
 
-            status = "Idle"
-            pan_cmd, tilt_cmd = follow.pan, follow.tilt
-            
-            if best is not None:
-                follow.state = "TRACKING"
-                follow.last_seen_ts = time.monotonic()
-                xmin, ymin, xmax, ymax = best["bbox"]
-                x_center = (xmin + xmax) * 0.5
-                y_center = (ymin + ymax) * 0.5
-                x_dev = 0.5 - x_center
-                
-                status = follow.drive_wheels(x_dev, y_max=ymax)
-                pan_cmd, tilt_cmd = follow.aim_servos(x_center, y_center)
+            # 프레임 스킵
+            do_infer = (frame_idx % FRAME_SKIP == 1)
+
+            if do_infer:
+                res = model.predict(frame, conf=CONF_THRES, imgsz=IMG_SIZE, verbose=False)[0]
+                y_values = frame_coordinates(res)
+                if valid_count(y_values) >= 6:
+                    check_falling(y_values, fps_used, on_fall=on_fall, announce_flag=announce_flag)
+
+                if USE_DISPLAY:
+                    out = res.plot()
+                    if fallen_state:
+                        cv2.putText(out, "fall detected", (40, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                    cv2.imshow("Video Feed", out)
             else:
-                if follow.state == "TRACKING" and time.monotonic() - follow.last_seen_ts > LOST_TIMEOUT:
-                    print("Target lost for too long. Entering SEARCH mode.")
-                    follow.state = "SEARCHING"
-                    follow.stop()
+                if USE_DISPLAY:
+                    out = frame.copy()
+                    if fallen_state:
+                        cv2.putText(out, "fall detected", (40, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                    cv2.imshow("Video Feed", out)
 
-                if follow.state == "SEARCHING":
-                    status = "Searching..."
-                    pan_cmd, tilt_cmd = follow.aim_servos(0.5, 0.5)
-                    car.Car_Spin_Left(SEARCH_SPEED, SEARCH_SPEED)
-            
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            if best:
-                (xmin, ymin, xmax, ymax) = best["bbox"]
-                x0, y0, x1, y1 = int(xmin * w), int(ymin * h), int(xmax * w), int(ymax * h)
-                cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
-            cv2.putText(bgr, f"STATUS: {status}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(bgr, f"PAN={int(pan_cmd)} TILT={int(tilt_cmd)}", (w - 200, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-            cv2.imshow(WINDOW, bgr)
-            
-            if (cv2.waitKey(1) & 0xFF) == 27: # ESC 키
+            if USE_DISPLAY and (cv2.waitKey(1) & 0xFF == ord('q')):
                 break
 
-    except KeyboardInterrupt:
-        print("\nProgram stopped by user.")
     finally:
-        print("Cleaning up...")
-        follow.stop()
         picam2.stop()
-        cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+        if USE_DISPLAY:
+            cv2.destroyAllWindows()

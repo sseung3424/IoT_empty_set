@@ -1,186 +1,144 @@
 # main.py
 # -*- coding: utf-8 -*-
 """
-Run two loops concurrently with a GUI-safe structure:
-1) Voice chatbot: STT -> LLM -> TTS  (worker thread)
-2) Person follower: follower_mod.main()  (MAIN thread for OpenCV GUI)
-
-Improvements:
-- Explicit logging of Listening / timeout / recognized / TTS done.
-- Longer STT timeout (12s) and option to disable.
-- Line-buffered stdout so prints from threads appear immediately.
-- Tiny sleep in patched waitKey to yield CPU to other threads.
+Run three workers concurrently:
+1) Tracking (camera+TFLite) -> publishes frames to BUS
+2) Fall detection (YOLO-pose, low frequency) -> reads from BUS
+3) Conversation (STT -> LLM -> TTS)
 """
 
-import os
-import sys
-import time
-import threading
-import queue
+import os, time, threading, signal, traceback
+from queue import Queue
 from dotenv import load_dotenv
 
-# -------- Load environment (.env must contain GEMINI_API_KEY) --------
+# 공존성 향상
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 load_dotenv()
 
-# Make stdout line-buffered so thread prints are visible immediately
-try:
-    sys.stdout.reconfigure(line_buffering=True)  # Py3.7+
-except Exception:
-    pass
+# ===== 옵션 =====
+DEBUG             = int(os.environ.get("DEBUG", "1"))
+MANUAL_INPUT      = int(os.environ.get("MANUAL_INPUT", "1"))   # 1: 키보드, 0: 마이크(STT)
+STT_TIMEOUT       = float(os.environ.get("STT_TIMEOUT", "10")) # 0이면 타임아웃 미사용
+HARD_EXIT_TIMEOUT = float(os.environ.get("HARD_EXIT_TIMEOUT", "2"))
+
+# ===== 모듈 =====
+from stt import speech_to_text
+from tts import text_to_speech
+from llm import ask_gemini
+
+from tracking import run_tracking           # <- 위에서 만든 함수
+from fall_worker import yolo_fall_loop      # <- 낙상 워커
+
+EXIT_WORDS = {"exit", "quit", "stop", "종료", "끝", "그만"}
 
 def log(msg: str):
-    print(msg, flush=True)
+    if DEBUG:
+        now = time.strftime("%H:%M:%S")
+        print(f"[{now}] {msg}", flush=True)
+    else:
+        print(msg, flush=True)
 
-# -------- Import local modules (voice chatbot) --------
-from stt import speech_to_text        # your STT function
-from tts import text_to_speech        # your TTS function
-from llm import ask_gemini            # your LLM function
-
-# -------- Import follower module --------
-# Set this to the actual module filename (without .py)
-# e.g., "tracking" or "follow_person_final" or "fall_det"
-FOLLOWER_MODULE = "fall_det"  # <- CHANGE THIS if your file is tracking.py etc.
-
-import cv2
-import importlib
-follower_mod = importlib.import_module(FOLLOWER_MODULE)
-
-# -------- STT timeout control --------
-USE_STT_TIMEOUT = True
-STT_TIMEOUT_SEC = 12.0  # seconds (increase from 4s)
-
-def stt_with_timeout(timeout_sec: float) -> str | None:
-    """
-    Run speech_to_text() in a small worker thread and return within timeout_sec.
-    Returns None on timeout or any STT error to keep the loop responsive.
-    """
-    q: "queue.Queue[str | None]" = queue.Queue(maxsize=1)
-
-    def _run():
+# ---------------- STT 타임아웃 래퍼(필요시) ----------------
+def stt_with_timeout(timeout_s: float) -> str:
+    if timeout_s <= 0:
+        return speech_to_text() or ""
+    q: Queue = Queue(maxsize=1)
+    errq: Queue = Queue(maxsize=1)
+    def _w():
         try:
-            q.put(speech_to_text())
+            q.put(speech_to_text() or "")
         except Exception as e:
-            log(f"[STT] Exception: {e}")
-            q.put(None)
+            errq.put(e)
+    th = threading.Thread(target=_w, daemon=True)
+    th.start()
+    th.join(timeout_s)
+    if th.is_alive():
+        log(f"[STT] timeout {timeout_s:.1f}s → skip this turn")
+        return ""
+    if not errq.empty():
+        raise errq.get()
+    return q.get() if not q.empty() else ""
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    try:
-        return q.get(timeout=timeout_sec)
-    except queue.Empty:
-        return None
-
-def voice_chatbot_loop(stop_event: threading.Event):
-    """STT -> LLM -> TTS loop (cooperates with stop_event)."""
-    log("=== Voice Chatbot (STT → LLM → TTS) ===")
+# ---------------- 대화 루프 ----------------
+def conv_loop(stop_event: threading.Event):
+    log("conv start (type/say 'exit/quit/stop/종료/끝/그만' to end)")
     while not stop_event.is_set():
-        # 1) STT (with optional timeout to prevent long blocking)
-        log("[Voice] Listening...")
-        if USE_STT_TIMEOUT:
-            user_text = stt_with_timeout(STT_TIMEOUT_SEC)
-            if user_text is None:
-                log("[Voice] STT timeout or no input detected.")
-                time.sleep(0.1)
-                continue
-        else:
-            try:
-                user_text = speech_to_text()
-            except Exception as e:
-                log(f"[STT] Error: {e}")
-                time.sleep(0.2)
+        try:
+            if MANUAL_INPUT:
+                try: user_text = input("User> ").strip()
+                except EOFError: user_text = ""
+            else:
+                user_text = stt_with_timeout(STT_TIMEOUT).strip()
+
+            if not user_text:
                 continue
 
-        if not user_text:
-            log("[Voice] Empty input.")
-            time.sleep(0.1)
-            continue
+            log(f"[User] {user_text}")
+            if user_text.lower() in EXIT_WORDS:
+                log("[conv] exit command detected")
+                stop_event.set(); break
 
-        log(f"[User] {user_text}")
+            reply = ask_gemini(user_text)
+            log(f"[LLM] {reply}")
 
-        # Exit keywords from user voice
-        if user_text.strip().lower() in ("exit", "quit", "stop"):
-            log("[INFO] Exit requested by user. Shutting down...")
-            stop_event.set()
-            break
+            try: text_to_speech(reply)
+            except Exception as e: log(f"[TTS] error: {e}")
 
-        # 2) LLM
-        try:
-            response = ask_gemini(user_text)
-        except Exception as e:
-            log(f"[LLM] Error: {e}")
-            response = "Sorry, I had an issue generating a reply."
-        log(f"[Gemini] {response}")
+        except Exception:
+            log("[conv] error:"); traceback.print_exc(); time.sleep(0.2)
 
-        # 3) TTS
-        try:
-            text_to_speech(response)
-            log("[TTS] Playback done.")
-        except Exception as e:
-            log(f"[TTS] Error: {e}")
+    log("conv terminated")
 
-    log("[Voice] Loop ended.")
-
-def _make_patched_waitKey(stop_event: threading.Event):
-    """
-    Create a patched cv2.waitKey that:
-    - returns ESC (27) when stop_event is set (to break follower loop),
-    - yields a tiny bit of time to other threads each call.
-    """
-    orig_waitKey = cv2.waitKey
-
-    def patched_waitKey(delay: int):
-        if stop_event.is_set():
-            return 27
-        ret = orig_waitKey(delay)
-        # Tiny yield helps the voice thread get scheduled if CPU is saturated
-        time.sleep(0.001)
-        return ret
-
-    return patched_waitKey
-
-def run_follower_in_main(stop_event: threading.Event):
-    """
-    Run follower_mod.main() on the MAIN thread (GUI-safe).
-    We patch cv2.waitKey so that when stop_event is set, follower exits cleanly.
-    """
-    log(f"=== Follower ({FOLLOWER_MODULE}.main) on MAIN thread ===")
-    patched = _make_patched_waitKey(stop_event)
-    orig_waitKey = cv2.waitKey
-    cv2.waitKey = patched
-    try:
-        follower_mod.main()  # follower's loop should call imshow + waitKey(1)
-    except Exception as e:
-        log(f"[Follower] Error: {e}")
-    finally:
-        cv2.waitKey = orig_waitKey
-        log("[Follower] Loop ended.")
-
+# ---------------- 엔트리 ----------------
 def main():
-    log("=== Multi-Runner: Chatbot (thread) + Follower (MAIN) ===")
-    log("Tips:")
-    log(" - Say 'exit' / 'quit' / 'stop' (via mic) to end both loops.")
-    log(" - Or press Ctrl+C in the terminal.\n")
-
     stop_event = threading.Event()
+    shutting = {"count": 0}
 
-    # Start voice chatbot as a background thread
-    t_voice = threading.Thread(target=voice_chatbot_loop, args=(stop_event,), daemon=True)
-    t_voice.start()
-    log("[MAIN] Voice thread started.")
+    def _signal_handler(signum, frame):
+        shutting["count"] += 1
+        log(f"[main] signal {signum} ({shutting['count']})")
+        stop_event.set()
+        if shutting["count"] == 1:
+            def _killer():
+                t0 = time.time()
+                while time.time() - t0 < HARD_EXIT_TIMEOUT and any(t.is_alive() for t in threads):
+                    time.sleep(0.1)
+                os._exit(0)
+            threading.Thread(target=_killer, daemon=True).start()
+        else:
+            os._exit(1)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # 1) 트래킹 스레드 (카메라 + 프레임 publish)
+    track_thread = threading.Thread(target=run_tracking, args=(stop_event,), daemon=True, name="tracking")
+    track_thread.start(); log("tracking thread started")
+
+    # 2) 낙상 감지 스레드 (YOLO-pose)
+    fall_thread = threading.Thread(target=yolo_fall_loop, args=(stop_event,), daemon=True, name="fall")
+    fall_thread.start(); log("fall thread started")
+
+    # 3) 대화 스레드 (STT→LLM→TTS)
+    conv_thread = threading.Thread(target=conv_loop, args=(stop_event,), daemon=True, name="conv")
+    conv_thread.start(); log("conv thread started")
+
+    global threads
+    threads = [track_thread, fall_thread, conv_thread]
 
     try:
-        # Run follower (camera/GUI) on MAIN thread for HighGUI/Qt safety
-        run_follower_in_main(stop_event)
-    except KeyboardInterrupt:
-        log("\n[MAIN] KeyboardInterrupt. Stopping...")
-        stop_event.set()
+        while not stop_event.is_set():
+            if any(not t.is_alive() for t in threads):
+                log("[main] a thread died → shutting down")
+                stop_event.set(); break
+            time.sleep(0.2)
     finally:
-        # Give voice thread a moment to exit gracefully
-        for _ in range(50):
-            if not t_voice.is_alive():
-                break
-            time.sleep(0.1)
-        log("[MAIN] All done. Bye.")
+        log("[main] joining threads...")
+        for t in threads:
+            t.join(timeout=1.5)
+        log("[main] bye")
 
 if __name__ == "__main__":
     main()
