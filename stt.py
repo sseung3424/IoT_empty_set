@@ -1,66 +1,47 @@
-# stt.py — ALSA arecord -D mic (RAW) → Google streaming, with keepalive silence
+# stt.py — capture via ALSA arecord -D mic → Google streaming
 from google.cloud import speech
 import subprocess, threading, queue, sys, time, os, signal
 
 # ====== Audio I/O config ======
-SAMPLE_RATE = 48000
+SAMPLE_RATE = 48000        # ~/.asoundrc의 mic 설정에 맞춤(48k)
 CHANNELS    = 1
-BYTES_PER_SAMPLE = 2            # S16_LE
-CHUNK_MS    = 20                # 더 짧게: 20ms
+BYTES_PER_SAMPLE = 2       # S16_LE
+CHUNK_MS    = 100
 CHUNK_BYTES = int(SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * (CHUNK_MS/1000.0))
-SILENCE_CHUNK = b"\x00" * CHUNK_BYTES
 
 # ====== Google STT client ======
 stt_client = speech.SpeechClient()
 
-def _request_generator(q: "queue.Queue[bytes]", stop_event: threading.Event):
-    """
-    Generator that yields audio chunks in (near) real-time.
-    - 즉시 무음 한 청크를 보내 API 'no audio' 타임아웃을 피함
-    - 큐가 잠깐 비면 무음 keepalive를 보냄(실시간 유지)
-    """
-    # 1) 빠른 초기 전송(무음 1청크)
-    yield speech.StreamingRecognizeRequest(audio_content=SILENCE_CHUNK)
-
-    last_send = time.time()
-    idle_keepalive_sec = 0.2  # 200ms 이상 비면 무음 전송
-    while not stop_event.is_set():
-        try:
-            chunk = q.get(timeout=idle_keepalive_sec)
-            if chunk is None:
-                break
-            yield speech.StreamingRecognizeRequest(audio_content=chunk)
-            last_send = time.time()
-        except queue.Empty:
-            # 큐가 비면 무음 keepalive
-            yield speech.StreamingRecognizeRequest(audio_content=SILENCE_CHUNK)
-            last_send = time.time()
+def _request_generator(q: "queue.Queue[bytes]"):
+    while True:
+        chunk = q.get()
+        if chunk is None:
+            return
+        yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
 def speech_to_text() -> str:
     """
-    Capture mic via ALSA (arecord -D mic -t raw), stream to Google STT.
+    Capture mic via ALSA (arecord -D mic), stream to Google STT.
     Returns first final transcript or "" on timeout/no-speech.
     """
-    print("[STT] Listening... (arecord -D mic, RAW)")
-    # ~/.asoundrc 의 'mic' PCM을 RAW로 캡처
+    print("[STT] Listening... (arecord -D mic)")
+    # ~/.asoundrc 에서 만든 'mic' PCM을 직접 사용
     cmd = [
         "arecord", "-q",
         "-D", "mic",
         "-r", str(SAMPLE_RATE),
         "-f", "S16_LE",
-        "-c", str(CHANNELS),
-        "-t", "raw"                 # ★ WAV 헤더 제거
+        "-c", str(CHANNELS)
     ]
+    # 파이프 열기
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # 파이프 오픈 (bufsize=0로 파이썬 버퍼링 최소화)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-
-    q: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
+    q: "queue.Queue[bytes]" = queue.Queue(maxsize=50)
     stop_event = threading.Event()
     final_text = ""
 
     def reader():
-        """arecord stdout에서 CHUNK_BYTES 단위로 읽어 큐에 넣음."""
+        """arecord stdout에서 고정 크기 청크로 읽어 큐에 넣음."""
         try:
             buf = b""
             while not stop_event.is_set():
@@ -86,16 +67,14 @@ def speech_to_text() -> str:
     )
     stream_config = speech.StreamingRecognitionConfig(
         config=recog_config,
-        interim_results=True,     # 중간 결과 로깅
-        single_utterance=True,    # 발화 + 잠깐 침묵 후 final
+        interim_results=True,     # 중간 결과도 확인
+        single_utterance=True,    # 발화 + 잠깐 침묵 → final
     )
 
     try:
-        requests  = _request_generator(q, stop_event)
+        requests = _request_generator(q)
         responses = stt_client.streaming_recognize(stream_config, requests)
         start = time.time()
-        max_secs = 12.0
-
         for response in responses:
             for result in response.results:
                 if result.is_final:
@@ -108,8 +87,8 @@ def speech_to_text() -> str:
                         print("[STT][interim]:", result.alternatives[0].transcript)
             if stop_event.is_set():
                 break
-            if time.time() - start > max_secs:
-                print("[STT] streaming timeout (no final)")
+            if time.time() - start > 10.0:  # 10초 안에 final 없으면 종료
+                print("[STT] streaming timeout")
                 break
     except Exception as e:
         print("[ERROR] STT streaming:", e, file=sys.stderr)
@@ -120,7 +99,7 @@ def speech_to_text() -> str:
         try:
             proc.terminate()
             try:
-                proc.wait(timeout=0.4)
+                proc.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 os.kill(proc.pid, signal.SIGKILL)
         except Exception:
