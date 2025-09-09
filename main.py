@@ -10,19 +10,18 @@ Run two loops concurrently with a GUI-safe structure:
 - Adds an STT timeout wrapper to avoid long blocking on mic input.
 """
 
-import os
 import time
 import threading
 import queue
 from dotenv import load_dotenv
 
-# -------- Load environment (.env must contain GEMINI_API_KEY) --------
+# -------- Load environment (.env must contain GEMINI_API_KEY & Google creds) --------
 load_dotenv()
 
 # -------- Import local modules (voice chatbot) --------
-from stt import speech_to_text        # your STT function
-from tts import text_to_speech        # your TTS function
-from llm import ask_gemini            # your LLM function
+from stt import speech_to_text        # your STT (sounddevice + Google STT)
+from tts import text_to_speech        # your TTS (Google TTS -> aplay)
+from llm import ask_gemini            # your LLM (Gemini)
 
 # -------- Import follower module --------
 # Assumes human_follower.py is in the same directory
@@ -83,7 +82,7 @@ def voice_chatbot_loop(stop_event: threading.Event):
         response = ask_gemini(user_text)
         print(f"[Gemini] {response}")
 
-        # 3) TTS
+        # 3) TTS (Google TTS -> aplay, releases device after playback)
         try:
             text_to_speech(response)
         except Exception as e:
@@ -118,7 +117,8 @@ def run_follower_in_main(stop_event: threading.Event):
     orig_waitKey = cv2.waitKey
     cv2.waitKey = patched
     try:
-        follower_mod.main()  # follower's loop should call imshow + waitKey(1)
+        # follower's loop should call imshow + waitKey(1) regularly
+        follower_mod.main()
     except Exception as e:
         print(f"[Follower] Error: {e}")
     finally:
