@@ -1,80 +1,116 @@
-# conv, tracking, fall_det 세개 메인 멀티 스레딩하기 -> 과제
-
 # main.py
-import threading
+import os
 import time
+import threading
 import signal
+from contextlib import contextmanager
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# conv
+# ====== 설정(환경변수) ======
+DEBUG         = int(os.environ.get("DEBUG", "1"))           # 1: 상세 로그
+MANUAL_INPUT  = int(os.environ.get("MANUAL_INPUT", "0"))    # 1: STT 대신 키보드 입력
+TRACKING_ON   = int(os.environ.get("TRACKING_ON", "1"))     # 0: tracking 비활성화
+
+# ====== 모듈 ======
 from stt import speech_to_text
 from tts import text_to_speech
 from llm import ask_gemini
+import tracking  # tracking.py는 수정하지 않음 (tracking.main 사용)
 
-# tracking: 파일은 그대로 두고, 내부의 main()을 호출
-import tracking
+# ====== 로깅/측정 유틸 ======
+def log(msg: str):
+    if DEBUG:
+        now = time.strftime("%H:%M:%S")
+        print(f"[{now}] {msg}")
+    else:
+        print(msg)
 
+@contextmanager
+def step(name: str):
+    t0 = time.time()
+    try:
+        yield
+    finally:
+        if DEBUG:
+            dt = (time.time() - t0) * 1000
+            log(f"{name} done in {dt:.1f} ms")
 
+# ====== 대화 루프 (메인 스레드에서 실행) ======
 def conv_loop(stop_event: threading.Event):
-    """STT → LLM → TTS 루프. 'exit/quit/stop' 음성 입력 시 전체 종료."""
-    print("[conv] start (say 'exit/quit/stop' to end)")
+    log("conv loop start (say 'exit/quit/stop' to end)")
     while not stop_event.is_set():
         try:
-            user_text = speech_to_text()
+            # 1) 입력
+            if MANUAL_INPUT:
+                user_text = input("User> ").strip()
+                if not user_text:
+                    continue
+            else:
+                with step("STT"):
+                    user_text = speech_to_text() or ""
             if not user_text:
                 continue
 
-            print(f"[User] {user_text}")
-            if user_text.strip().lower() in ("exit", "quit", "stop"):
-                print("[conv] exit command detected")
+            log(f"[User] {user_text}")
+
+            # 종료 명령
+            if user_text.lower() in ("exit", "quit", "stop"):
+                log("exit command detected")
                 stop_event.set()
                 break
 
-            reply = ask_gemini(user_text)
-            print(f"[LLM] {reply}")
-            text_to_speech(reply)
+            # 2) LLM
+            with step("LLM"):
+                reply = ask_gemini(user_text)
 
+            log(f"[LLM] {reply}")
+
+            # 3) 출력(TTS)
+            try:
+                with step("TTS"):
+                    text_to_speech(reply)
+            except Exception as e:
+                log(f"TTS error: {e} (skip)")
+
+        except KeyboardInterrupt:
+            log("KeyboardInterrupt in conv loop")
+            stop_event.set()
+            break
         except Exception as e:
-            print(f"[conv] error: {e}")
-            time.sleep(0.3)
-    print("[conv] terminated")
+            # conv 단계 어디서든 예외를 삼키지 않고 보여줌
+            log(f"conv error: {e}")
+            time.sleep(0.2)
 
+    log("conv loop terminated")
 
+# ====== 메인 ======
 def main():
     stop_event = threading.Event()
 
-    # Ctrl+C 등 시그널 → stop_event
+    # 시그널 → 종료
     def _on_signal(signum, frame):
-        print(f"[main] signal {signum} → shutting down")
+        log(f"signal {signum} → shutting down")
         stop_event.set()
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    # 스레드 생성
-    conv_thread = threading.Thread(target=conv_loop, args=(stop_event,), daemon=True)
-    # tracking.py는 수정하지 않았으므로, 그 안의 main()을 그대로 호출
-    track_thread = threading.Thread(target=tracking.main, daemon=True)
+    # tracking은 백그라운드에서 실행(디버깅 방해 ↓)
+    if TRACKING_ON:
+        track_thread = threading.Thread(target=tracking.main, daemon=True)
+        track_thread.start()
+        log("tracking thread started (daemon)")
+    else:
+        log("tracking disabled (TRACKING_ON=0)")
 
-    # 시작
-    conv_thread.start()
-    track_thread.start()
-
-    print("=== CONV + TRACKING (threads) ===")
-    print(" - 음성 'exit/quit/stop' → 전체 종료")
-    print(" - tracking 창 ESC → tracking만 종료(다시 실행하려면 프로그램 재시작)")
-
-    # 메인스레드는 종료 신호 대기
+    # conv는 메인 스레드에서 실행 → 디버깅 편의성 ↑
     try:
-        while not stop_event.is_set():
-            time.sleep(0.2)
+        conv_loop(stop_event)
     finally:
-        print("[main] waiting threads...")
-        conv_thread.join(timeout=2.0)
-        # track_thread는 daemon=True이므로 프로세스 종료 시 함께 종료됨
-        print("[main] all done")
-
+        log("waiting background threads...")
+        # tracking은 daemon=True라 프로세스 종료와 함께 내려감
+        log("all done")
 
 if __name__ == "__main__":
     main()
