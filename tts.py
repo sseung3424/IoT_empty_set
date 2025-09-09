@@ -9,7 +9,7 @@ import tempfile
 # ====== Audio I/O config ======
 SAMPLE_RATE = 48000          # USB 헤드셋에 맞춰 48 kHz 요청
 CHANNELS = 1                 # Google TTS는 mono로 받아도 충분
-APLAY_DEVICE = "plughw:3,0"  # 또는 ~/.asoundrc를 썼다면 "speaker" 로 바꿔도 됨 (권장: "speaker")
+APLAY_DEVICE = "speaker"  # 또는 ~/.asoundrc를 썼다면 "speaker" 로 바꿔도 됨 (권장: "speaker")
 
 tts_client = texttospeech.TextToSpeechClient()
 
