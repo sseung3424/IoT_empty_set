@@ -1,2 +1,3 @@
+robot/.env
 .env
-service-account.json
+robot/service-account.json

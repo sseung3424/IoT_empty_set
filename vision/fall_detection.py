@@ -228,3 +228,91 @@ def run_detection(on_fall=None):
         picam2.stop()
         if USE_DISPLAY:
             cv2.destroyAllWindows()
+
+# === (추가) 외부 캡처 소스에서 감지 루프 ===
+def run_detection_from_capture(capture, on_fall=None, use_display=USE_DISPLAY):
+    """
+    OpenCV VideoCapture 등 'capture.read()'가 가능한 소스로부터 프레임을 받아
+    상단의 동일 FSM 로직으로 낙상 감지를 수행한다.
+    """
+    global falling_threshold, first_vel_threshold, second_vel_threshold
+    import time
+
+    # FPS 측정(간단)
+    print("[cap] warming up & measuring FPS...")
+    t0 = time.time(); cnt = 0
+    while cnt < 30:
+        ok, _ = capture.read()
+        if not ok: continue
+        cnt += 1
+    fps_used = max(10.0, 30.0/(time.time() - t0))
+    print(f"[cap] estimated FPS ≈ {fps_used:.1f}")
+
+    # 모델
+    model = YOLO(MODEL_PATH)
+    if use_display:
+        cv2.namedWindow("Video Feed", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Video Feed", 960, 540)
+
+    # 부트스트랩: 유효 프레임 2장
+    res_first, res_second = None, None
+    for _ in range(400):
+        ok, frame = capture.read()
+        if not ok: continue
+        res = model.predict(frame, conf=CONF_THRES, imgsz=IMG_SIZE, verbose=False)[0]
+        yvals = frame_coordinates(res)
+        if valid_count(yvals) >= 6:
+            if res_first is None:
+                res_first = res
+            else:
+                res_second = res
+                if init_thresholds_from_two_frames(res_first, res_second, fps_used):
+                    break
+                else:
+                    res_first, res_second = res_second, None
+        if use_display:
+            cv2.imshow("Video Feed", res.plot())
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                if use_display: cv2.destroyAllWindows()
+                return
+
+    if falling_threshold is None:   falling_threshold = 400.0
+    if first_vel_threshold is None: first_vel_threshold = 120.0
+    if second_vel_threshold is None:second_vel_threshold = 120.0
+    print(f"[init-check] fall_thr={falling_threshold:.1f}, v0_thr={first_vel_threshold:.1f}, v5_thr={second_vel_threshold:.1f}, fps≈{fps_used:.1f}, imgsz={IMG_SIZE}, skip={FRAME_SKIP}")
+
+    announce_flag = {"done": False}
+    frame_idx = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok: continue
+            frame_idx += 1
+
+            do_infer = (frame_idx % FRAME_SKIP == 1)
+            if do_infer:
+                res = model.predict(frame, conf=CONF_THRES, imgsz=IMG_SIZE, verbose=False)[0]
+                y_values = frame_coordinates(res)
+                if valid_count(y_values) >= 6:
+                    check_falling(y_values, fps_used, on_fall=on_fall, announce_flag=announce_flag)
+
+                if use_display:
+                    out = res.plot()
+                    if fallen_state:
+                        cv2.putText(out, "fall detected", (40, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                    cv2.imshow("Video Feed", out)
+            else:
+                if use_display:
+                    out = frame.copy()
+                    if fallen_state:
+                        cv2.putText(out, "fall detected", (40, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                    cv2.imshow("Video Feed", out)
+
+            if use_display and (cv2.waitKey(1) & 0xFF == ord('q')):
+                break
+
+    finally:
+        if use_display:
+            cv2.destroyAllWindows()

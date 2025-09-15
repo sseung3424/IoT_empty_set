@@ -4,7 +4,7 @@ import time
 import numpy as np
 import cv2
 from picamera2 import Picamera2
-from YB_Pcb_Car import YB_Pcb_Car
+from robot.YB_Pcb_Car import YB_Pcb_Car
 from tflite_runtime.interpreter import Interpreter # tflite import 추가
 
 # ---------------------- TFLite helpers (CPU) ----------------------

@@ -6,17 +6,17 @@ import cv2
 import threading
 import time
 
-from fall_det import FallDetector, cleanup
-from tts import text_to_speech
-from stt import speech_to_text
-from llm import ask_gemini
+from robot.fall_det import FallDetector, cleanup
+from robot.tts import text_to_speech
+from robot.stt import speech_to_text
+from robot.llm import ask_gemini
 
 # Robot control (motors/servo via I2C)
 from yb_car import YB_Pcb_Car
 
 # Tracking module (interface can vary across your codebase)
 try:
-    import tracking as tracking_mod
+    import robot.tracking as tracking_mod
 except Exception:
     tracking_mod = None
 
