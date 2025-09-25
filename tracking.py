@@ -5,7 +5,7 @@ import numpy as np
 import cv2
 from picamera2 import Picamera2
 from YB_Pcb_Car import YB_Pcb_Car
-from tflite_runtime.interpreter import Interpreter # tflite import 추가
+from tflite_runtime.interpreter import Interpreter  # tflite import
 
 # ---------------------- TFLite helpers (CPU) ----------------------
 def load_labels(path):
@@ -43,7 +43,7 @@ def get_output(interpreter, conf_thresh=0.3):
             continue
         ymin, xmin, ymax, xmax = boxes[i]
         results.append({
-            "bbox": (float(xmin), float(ymin), float(xmax), float(ymax)),
+            "bbox": (float(xmin), float(ymin), float(xmax), float(ymax)),  # (xmin, ymin, xmax, ymax)
             "score": float(scores[i]),
             "class_id": int(classes[i]),
         })
@@ -68,25 +68,27 @@ PAN_ID = 0
 TILT_ID = 1
 PAN_CENTER  = 90
 TILT_CENTER = 90
-PAN_GAIN    = 150.0
-TILT_GAIN   = 120.0
+
+# 이득(서보 민감도) – 흔들림 억제를 위해 기존 대비 하향
+PAN_GAIN    = 105.0   # (기존 150.0)
+TILT_GAIN   = 84.0    # (기존 120.0)
+
+# 서보 완충(EMA 비율: 이전값 가중치)
 PAN_SMOOTH  = 0.20
 TILT_SMOOTH = 0.30
+
+# 각도 제한: 반드시 90°(센터)를 포함하도록 범위를 넓힘
 PAN_MIN, PAN_MAX   = 0, 180
-TILT_MIN, TILT_MAX = 45, 70
+TILT_MIN, TILT_MAX = 45, 120
 
 LOST_TIMEOUT = 3.0
 SEARCH_SPEED = 50
 
-
-CENTER_EMA = 0.70
-
-SERVO_UPDATE_HZ = 12
-MAX_STEP_DEG = 2
-CENTER_DEADZONE_SERVO = 0.04
-
-PAN_GAIN = 105.0
-TILT_GAIN = 84.0
+# --- 흔들림 완화 파라미터 ---
+CENTER_EMA = 0.70                 # 검출 중심 좌표 EMA(이전값 가중치)
+SERVO_UPDATE_HZ = 12              # 서보 갱신 빈도(Hz)
+MAX_STEP_DEG = 2                  # 프레임당 최대 각도 변화(±deg)
+CENTER_DEADZONE_SERVO = 0.04      # 서보용 중심 데드존(정규화 좌표 기준)
 # ----------------------------------------------------
 
 class Follower:
@@ -97,9 +99,11 @@ class Follower:
         self.state = "SEARCHING"
         self.last_seen_ts = 0.0
 
+        # 검출 중심 좌표 스무딩 상태
         self.xc_smooth = 0.5
         self.yc_smooth = 0.5
 
+        # 서보 업데이트 타이밍
         self._servo_next_ts = 0.0
 
         try:
@@ -111,86 +115,72 @@ class Follower:
     @staticmethod
     def _clamp(v, lo, hi):
         return max(lo, min(hi, v))
-    
+
+    def stop(self):
+        self.car.Car_Stop()
+
+    def drive_wheels(self, x_dev, y_max):
+        # 근접 정지
+        if y_max > STOP_NEAR_Y:
+            self.stop()
+            return "Stop"
+        # 중앙 근처는 조향 0
+        if abs(x_dev) < CENTER_DEADZONE:
+            delta = 0
+        else:
+            delta = int(Kx * x_dev)
+
+        l = self._clamp(BASE_SPEED - delta, MIN_SPEED, MAX_SPEED)
+        r = self._clamp(BASE_SPEED + delta, MIN_SPEED, MAX_SPEED)
+        self.car.Car_Run(l, r)
+
+        if delta > 10: return f"Forward-R({r})"
+        elif delta < -10: return f"Forward-L({l})"
+        else: return "Forward"
+
     def aim_servos(self, x_center, y_center):
         """
-        변경점:
-        1) 입력 중심 좌표를 EMA로 스무딩
-        2) 데드존: 중심 근처면 갱신 생략
-        3) 레이트 리미트: 프레임당 각도 변화 제한
-        4) 업데이트 주기 제한: SERVO_UPDATE_HZ로만 갱신
+        서보 안정화 포함:
+        1) 검출 중심 좌표 EMA 스무딩
+        2) 서보 중심 데드존
+        3) 업데이트 주기 제한(SERVO_UPDATE_HZ)
+        4) 목표각 계산 + 기존 EMA 완충
+        5) 프레임당 각도 변화 레이트 리미트
+        6) 각도 클램프 후 보드에 쓰기
         """
-        # 1) 좌표 스무딩 (EMA: 이전값 비중 CENTER_EMA)
+        # 1) 좌표 스무딩 (EMA)
         self.xc_smooth = CENTER_EMA * self.xc_smooth + (1.0 - CENTER_EMA) * x_center
         self.yc_smooth = CENTER_EMA * self.yc_smooth + (1.0 - CENTER_EMA) * y_center
 
-        # 2) 데드존 체크
+        # 2) 데드존
         if abs(self.xc_smooth - 0.5) < CENTER_DEADZONE_SERVO and \
            abs(self.yc_smooth - 0.5) < CENTER_DEADZONE_SERVO:
-            # 너무 미세한 오차는 무시: 현재 각도 유지, 보드 전달도 생략
             return int(self.pan), int(self.tilt)
 
-        # 4) 업데이트 주기 제한
+        # 3) 업데이트 주기 제한
         now = time.monotonic()
         if now < self._servo_next_ts:
             return int(self.pan), int(self.tilt)
-        period = 1.0 / SERVO_UPDATE_HZ
-        self._servo_next_ts = now + period
+        self._servo_next_ts = now + (1.0 / SERVO_UPDATE_HZ)
 
-        # 목표각 계산(기존 식 그대로, 단 스무딩된 중심 사용)
+        # 4) 목표각 계산(스무딩된 중심 사용) + 기존 EMA 완충
         pan_target  = PAN_CENTER + (0.5 - self.xc_smooth) * PAN_GAIN
         tilt_target = TILT_CENTER - (self.yc_smooth - 0.5) * TILT_GAIN
 
-        # 기존 EMA 완충(기존 코드 유지)
-        self.pan  = (1 - PAN_SMOOTH)  * pan_target  + PAN_SMOOTH  * self.pan
-        self.tilt = (1 - TILT_SMOOTH) * tilt_target + TILT_SMOOTH * self.tilt
+        new_pan  = (1 - PAN_SMOOTH)  * pan_target  + PAN_SMOOTH  * self.pan
+        new_tilt = (1 - TILT_SMOOTH) * tilt_target + TILT_SMOOTH * self.tilt
 
-        # 3) 레이트 리미트(프레임당 변화량 제한)
+        # 5) 레이트 리미트(프레임당 변화량 제한)
         def limit_step(curr, prev):
             delta = curr - prev
             if   delta >  MAX_STEP_DEG: curr = prev + MAX_STEP_DEG
             elif delta < -MAX_STEP_DEG: curr = prev - MAX_STEP_DEG
             return curr
 
-        # 이전 명령값 보관 후 제한 적용
-        prev_pan, prev_tilt = self.pan, self.tilt
-        self.pan  = limit_step(self.pan,  prev_pan)
-        self.tilt = limit_step(self.tilt, prev_tilt)
+        self.pan  = limit_step(new_pan,  self.pan)
+        self.tilt = limit_step(new_tilt, self.tilt)
 
-        pan_cmd  = int(self._clamp(round(self.pan),  PAN_MIN,  PAN_MAX))
-        tilt_cmd = int(self._clamp(round(self.tilt), TILT_MIN, TILT_MAX))
-        try:
-            self.car.Ctrl_Servo(PAN_ID, pan_cmd)
-            self.car.Ctrl_Servo(TILT_ID, tilt_cmd)
-        except Exception as e:
-            print("Servo write failed:", e)
-        return pan_cmd, tilt_cmd
-
-    def stop(self):
-        self.car.Car_Stop()
-
-    def drive_wheels(self, x_dev, y_max):
-        if y_max > STOP_NEAR_Y:
-            self.stop()
-            return "Stop"
-        if abs(x_dev) < CENTER_DEADZONE:
-            delta = 0
-        else:
-            delta = int(Kx * x_dev)
-        
-        l = self._clamp(BASE_SPEED - delta, MIN_SPEED, MAX_SPEED)
-        r = self._clamp(BASE_SPEED + delta, MIN_SPEED, MAX_SPEED)
-        self.car.Car_Run(l, r)
-        
-        if delta > 10: return f"Forward-R({r})"
-        elif delta < -10: return f"Forward-L({l})"
-        else: return "Forward"
-
-    def aim_servos(self, x_center, y_center):
-        pan_target  = PAN_CENTER + (0.5 - x_center) * PAN_GAIN
-        tilt_target = TILT_CENTER - (y_center - 0.5) * TILT_GAIN
-        self.pan  = (1 - PAN_SMOOTH)  * pan_target  + PAN_SMOOTH  * self.pan
-        self.tilt = (1 - TILT_SMOOTH) * tilt_target + TILT_SMOOTH * self.tilt
+        # 6) 각도 클램프 + 명령
         pan_cmd  = int(self._clamp(round(self.pan),  PAN_MIN,  PAN_MAX))
         tilt_cmd = int(self._clamp(round(self.tilt), TILT_MIN, TILT_MAX))
         try:
@@ -204,8 +194,10 @@ def main():
     labels = load_labels(os.path.join(MODEL_DIR, LABELS_TXT))
     interpreter = make_interpreter_cpu(os.path.join(MODEL_DIR, MODEL_CPU))
     interpreter.allocate_tensors()
+
     car = YB_Pcb_Car()
     follow = Follower(car)
+
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
     picam2.configure(config)
@@ -217,15 +209,19 @@ def main():
         while True:
             rgb = picam2.capture_array()
             h, w, _ = rgb.shape
+
             set_input_tensor(interpreter, rgb)
             interpreter.invoke()
             detections = get_output(interpreter, CONF_THRESH)
-            best = max([d for d in detections if labels.get(d["class_id"]) == TARGET_LABEL], 
-                       key=lambda x: x["score"], default=None)
+
+            best = max(
+                [d for d in detections if labels.get(d["class_id"]) == TARGET_LABEL],
+                key=lambda x: x["score"], default=None
+            )
 
             status = "Idle"
             pan_cmd, tilt_cmd = follow.pan, follow.tilt
-            
+
             if best is not None:
                 follow.state = "TRACKING"
                 follow.last_seen_ts = time.monotonic()
@@ -233,7 +229,7 @@ def main():
                 x_center = (xmin + xmax) * 0.5
                 y_center = (ymin + ymax) * 0.5
                 x_dev = 0.5 - x_center
-                
+
                 status = follow.drive_wheels(x_dev, y_max=ymax)
                 pan_cmd, tilt_cmd = follow.aim_servos(x_center, y_center)
             else:
@@ -246,18 +242,30 @@ def main():
                     status = "Searching..."
                     pan_cmd, tilt_cmd = follow.aim_servos(0.5, 0.5)
                     car.Car_Spin_Left(SEARCH_SPEED, SEARCH_SPEED)
-            
+
+            # --- Rendering ---
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            # 디버그: 라벨/점수/근접지표 확인용(필요시 주석 해제)
+            label_text = "NO PERSON"
             if best:
                 (xmin, ymin, xmax, ymax) = best["bbox"]
                 x0, y0, x1, y1 = int(xmin * w), int(ymin * h), int(xmax * w), int(ymax * h)
                 cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
-            cv2.putText(bgr, f"STATUS: {status}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(bgr, f"PAN={int(pan_cmd)} TILT={int(tilt_cmd)}", (w - 200, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+                label_text = f"LBL=person score={best['score']:.2f} ymax={ymax:.2f}"
+
+            cv2.putText(bgr, f"STATUS: {status}", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(bgr, label_text, (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(bgr, f"PAN={int(pan_cmd)} TILT={int(tilt_cmd)}", (w - 230, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
             cv2.imshow(WINDOW, bgr)
-            
-            if (cv2.waitKey(1) & 0xFF) == 27: # ESC 키
+
+            if (cv2.waitKey(1) & 0xFF) == 27:  # ESC
                 break
+
+            # CPU 양보(선택)
+            # time.sleep(0.001)
 
     except KeyboardInterrupt:
         print("\nProgram stopped by user.")
