@@ -5,6 +5,32 @@ import numpy as np
 from ultralytics import YOLO
 from picamera2 import Picamera2
 
+# === MJPEG 스트리밍 훅 ===
+import cv2, threading, time
+_stream_lock = threading.Lock()
+_stream_jpeg = b''
+
+def stream_publish(bgr):
+    """BGR 프레임을 JPEG로 인코딩해 최신 프레임으로 보관."""
+    global _stream_jpeg
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if ok:
+        with _stream_lock:
+            _stream_jpeg = buf.tobytes()
+
+def mjpeg_generator():
+    """Flask Response용 제너레이터 (multipart/x-mixed-replace)."""
+    boundary = b'--frame'
+    while True:
+        with _stream_lock:
+            frame = _stream_jpeg
+        if frame:
+            yield (boundary +
+                   b"\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                   str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+        time.sleep(0.05)  # ~20 FPS
+
+
 # ====== 환경/튜닝 ======
 USE_DISPLAY = bool(int(os.environ.get("USE_DISPLAY", "1")))  # 0이면 창 미표시
 CONF_THRES  = float(os.environ.get("CONF_THRES", "0.30"))
@@ -180,6 +206,10 @@ def run_detection(on_fall=None):
                 else:
                     res_first, res_second = res_second, None
         if USE_DISPLAY:
+            # 예: 화면에 띄우는 최종 BGR 프레임이 'canvas' 라면:
+            stream_publish(canvas)    # <-- 이 한 줄 추가
+            # 혹은 변수명이 frame/vis/bgr 등이라면 그 이름을 넣어 주세요.
+
             cv2.imshow("Video Feed", res.plot())
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 picam2.stop(); cv2.destroyAllWindows(); return
