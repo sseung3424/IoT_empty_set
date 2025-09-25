@@ -77,6 +77,16 @@ TILT_MIN, TILT_MAX = 45, 90
 
 LOST_TIMEOUT = 3.0
 SEARCH_SPEED = 50
+
+
+CENTER_EMA = 0.70
+
+SERVO_UPDATE_HZ = 12
+MAX_STEP_DEG = 2
+CENTER_DEADZONE_SERVO = 0.04
+
+PAN_GAIN = 105.0
+TILT_GAIN = 84.0
 # ----------------------------------------------------
 
 class Follower:
