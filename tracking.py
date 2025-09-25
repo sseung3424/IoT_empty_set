@@ -63,7 +63,10 @@ MAX_SPEED  = 120
 MIN_SPEED  = 60
 Kx = 200.0
 CENTER_DEADZONE = 0.10
-STOP_NEAR_Y     = 0.90
+
+# 근접 정지(박스 높이 기반 + 히스테리시스)
+STOP_NEAR_H_ENGAGE  = 0.60   # 이 이상이면 "가깝다"로 판단 → 정지
+STOP_NEAR_H_RELEASE = 0.55   # 이 미만이면 "가까움 해제" → 주행 재개
 
 # 서보
 PAN_ID = 0
@@ -92,18 +95,18 @@ CRUISE_DEADZONE = 0.18
 DELTA_EMA       = 0.60
 MAX_DELTA_STEP  = 10.0
 
-# --- 검색 패턴(Searching) : 수정 포인트 ---
+# --- 검색 패턴(Searching) ---
 SEARCH_SPIN_SPEED   = 45     # 회전 속도(좌/우 같은 값)
-SPIN_RATE_DEG_PER_SEC_AT_100 = 6.0   # 경험치: 속도 100일 때 각속도(°/s)
-SEARCH_FULL_TURN_MARGIN = 1.10       # 360°의 10% 여유(정확히 한 바퀴 보장)
+SPIN_RATE_DEG_PER_SEC_AT_100 = 6.0   # speed=100일 때 각속도(°/s)
+SEARCH_FULL_TURN_MARGIN = 1.10       # 360°의 10% 여유
 
 # Step-and-Stare (모션블러 저감)
 SEARCH_BURST_MS = 180   # 회전하는 구간(ms)
 SEARCH_HOLD_MS  = 140   # 정지하여 탐지하는 구간(ms)
 
-# 팬 스윕(옵션: 시선 훑기)
-SEARCH_SWEEP_HZ   = 0.4
-SEARCH_SWEEP_AMPL = 0.30
+# 팬 스윕(서보 각도 기준으로 정확히 ±30° 보장)
+PAN_SWEEP_AMPL_DEG = 30.0    # 원하는 팬 스윕 각도(±deg)
+SEARCH_SWEEP_HZ    = 0.4     # 스윕 주파수(Hz)
 # ----------------------------------------------------
 
 class Follower:
@@ -114,7 +117,7 @@ class Follower:
         self.state = "SEARCHING"
         self.last_seen_ts = 0.0
 
-        # 서보 좌표 스무딩
+        # 서보 좌표 스무딩(추적용)
         self.xc_smooth = 0.5
         self.yc_smooth = 0.5
         self._servo_next_ts = 0.0
@@ -123,12 +126,15 @@ class Follower:
         self.delta_smooth = 0.0
         self._last_delta  = 0.0
 
-        # --- Searching 상태 변수들 (새로 추가) ---
+        # 근접 히스테리시스 상태
+        self.near = False
+
+        # Searching 상태 변수
         self.search_start_ts = 0.0
-        self.search_dir = +1           # +1: 좌회전(L), -1: 우회전(R)
-        self.spin_accum_deg = 0.0      # 누적 회전각(°)
+        self.search_dir = +1           # +1: 좌, -1: 우
+        self.spin_accum_deg = 0.0
         self._search_phase = "BURST"   # "BURST" or "HOLD"
-        self._phase_ts = 0.0           # 현재 phase 시작 시각
+        self._phase_ts = 0.0
 
         try:
             self.car.Ctrl_Servo(PAN_ID, self.pan)
@@ -144,27 +150,38 @@ class Follower:
         self.car.Car_Stop()
 
     # -------- 바퀴 제어(직진 중심) --------
-    def drive_wheels(self, x_dev, y_max):
-        if y_max > STOP_NEAR_Y:
-            self.stop()
-            return "Stop"
+    def drive_wheels(self, x_dev, ymin, ymax):
+        # 근접 정지 판단: 박스 높이 기반 + 히스테리시스
+        h_norm = float(max(0.0, ymax - ymin))
+        if self.near:
+            if h_norm < STOP_NEAR_H_RELEASE:
+                self.near = False  # 근접 해제 → 주행 가능
+            else:
+                self.stop()
+                return "Stop(near)"
+        else:
+            if h_norm > STOP_NEAR_H_ENGAGE:
+                self.near = True
+                self.stop()
+                return "Stop(near)"
 
+        # ① 크루즈 창: 중앙 근처는 완전 직진
         if abs(x_dev) <= CRUISE_DEADZONE:
             self.delta_smooth = 0.0
             l = r = self._clamp(BASE_SPEED, MIN_SPEED, MAX_SPEED)
             self.car.Car_Run(l, r)
             return "Cruise(Ω)"
 
+        # ②~④ Δ 계산(EMA + 레이트 리미트)
         raw_delta = float(Kx * x_dev)
         delta_lp = DELTA_EMA * self.delta_smooth + (1.0 - DELTA_EMA) * raw_delta
-
         step = delta_lp - self._last_delta
         if step >  MAX_DELTA_STEP: delta_lp = self._last_delta + MAX_DELTA_STEP
         elif step < -MAX_DELTA_STEP: delta_lp = self._last_delta - MAX_DELTA_STEP
-
         self._last_delta  = delta_lp
         self.delta_smooth = delta_lp
 
+        # ⑤ 좌/우 속도 적용
         l = self._clamp(int(BASE_SPEED - delta_lp), MIN_SPEED, MAX_SPEED)
         r = self._clamp(int(BASE_SPEED + delta_lp), MIN_SPEED, MAX_SPEED)
         self.car.Car_Run(l, r)
@@ -173,8 +190,9 @@ class Follower:
         if delta_lp < -10: return f"Fwd-L({l})"
         return "Forward"
 
-    # -------- 서보 제어(안정화 포함) --------
+    # -------- 서보 제어(추적용: 이미지 좌표→각도) --------
     def aim_servos(self, x_center, y_center):
+        # 추적 시엔 이미지 좌표 기반 + 데드존/EMA/주기/레이트리미트 적용
         self.xc_smooth = CENTER_EMA * self.xc_smooth + (1.0 - CENTER_EMA) * x_center
         self.yc_smooth = CENTER_EMA * self.yc_smooth + (1.0 - CENTER_EMA) * y_center
 
@@ -190,9 +208,27 @@ class Follower:
         pan_target  = PAN_CENTER + (0.5 - self.xc_smooth) * PAN_GAIN
         tilt_target = TILT_CENTER - (self.yc_smooth - 0.5) * TILT_GAIN
 
+        return self._apply_servo_targets(pan_target, tilt_target)
+
+    # -------- 서칭용: 목표 각도로 직접 지시(±PAN_SWEEP_AMPL_DEG 보장) --------
+    def aim_servos_to_angles(self, pan_target_deg, tilt_target_deg=None):
+        # 데드존/좌표 EMA를 우회하고, 동일한 완충/레이트리미트/클램프만 적용
+        if tilt_target_deg is None:
+            tilt_target_deg = self.tilt  # 틸트는 유지
+        # 서보 갱신 주기 제한
+        now = time.monotonic()
+        if now < self._servo_next_ts:
+            return int(self.pan), int(self.tilt)
+        self._servo_next_ts = now + (1.0 / SERVO_UPDATE_HZ)
+        return self._apply_servo_targets(pan_target_deg, tilt_target_deg)
+
+    # -------- 공통: 완충(EMA) + 레이트리미트 + 클램프 + 쓰기 --------
+    def _apply_servo_targets(self, pan_target, tilt_target):
+        # 완충(EMA)
         new_pan  = (1 - PAN_SMOOTH)  * pan_target  + PAN_SMOOTH  * self.pan
         new_tilt = (1 - TILT_SMOOTH) * tilt_target + TILT_SMOOTH * self.tilt
 
+        # 레이트 리미트
         def limit_step(curr, prev):
             delta = curr - prev
             if   delta >  MAX_STEP_DEG: curr = prev + MAX_STEP_DEG
@@ -202,6 +238,7 @@ class Follower:
         self.pan  = limit_step(new_pan,  self.pan)
         self.tilt = limit_step(new_tilt, self.tilt)
 
+        # 클램프 + 쓰기
         pan_cmd  = int(self._clamp(round(self.pan),  PAN_MIN,  PAN_MAX))
         tilt_cmd = int(self._clamp(round(self.tilt), TILT_MIN, TILT_MAX))
         try:
@@ -211,56 +248,47 @@ class Follower:
             print("Servo write failed:", e)
         return pan_cmd, tilt_cmd
 
-    # -------- 검색 패턴(한 바퀴 보장 + step-and-stare) --------
+    # -------- 검색 패턴(한 바퀴 보장 + step-and-stare + ±30° 팬 스윕) --------
     def searching_step(self):
-        """
-        - 한 사이클에 '한 바퀴(360° × margin)'를 꼭 돌며,
-        - BURST(짧게 회전) ↔ HOLD(멈추고 탐지) 를 반복해 모션블러를 줄인다.
-        - 팬은 완만히 좌↔우 스윕(옵션)
-        """
         now = time.monotonic()
-        # 팬 스윕(시선 훑기)
+        # 팬을 정확히 ±PAN_SWEEP_AMPL_DEG로 스윕
         t = now - self.search_start_ts
-        x_center = 0.5 + SEARCH_SWEEP_AMPL * np.sin(2 * np.pi * SEARCH_SWEEP_HZ * t)
-        self.aim_servos(x_center, 0.5)
+        pan_target = PAN_CENTER + PAN_SWEEP_AMPL_DEG * np.sin(2 * np.pi * SEARCH_SWEEP_HZ * t)
+        self.aim_servos_to_angles(pan_target, self.tilt)
 
         # 각속도(°/s) 추정
-        rate_100 = SPIN_RATE_DEG_PER_SEC_AT_100  # speed=100 기준
+        rate_100 = SPIN_RATE_DEG_PER_SEC_AT_100
         rate = rate_100 * (SEARCH_SPIN_SPEED / 100.0)
 
-        # phase 전환 로직
+        # phase 전환
         if self._phase_ts == 0.0:
-            self._phase_ts = now  # 초기화
-
+            self._phase_ts = now
         elapsed_ms = (now - self._phase_ts) * 1000.0
 
         if self._search_phase == "BURST":
-            # 회전 수행
+            # 회전
             if self.search_dir > 0:
                 self.car.Car_Spin_Left(SEARCH_SPIN_SPEED, SEARCH_SPIN_SPEED)
             else:
                 self.car.Car_Spin_Right(SEARCH_SPIN_SPEED, SEARCH_SPIN_SPEED)
-
-            # 누적 각도 업데이트
+            # 누적 각도
             dt = (elapsed_ms / 1000.0)
             self.spin_accum_deg += rate * dt
-            # BURST 구간 종료 판단
             if elapsed_ms >= SEARCH_BURST_MS:
                 self._search_phase = "HOLD"
                 self._phase_ts = now
                 self.car.Car_Stop()
-
-        else:  # HOLD
+        else:
             self.car.Car_Stop()
             if elapsed_ms >= SEARCH_HOLD_MS:
                 self._search_phase = "BURST"
                 self._phase_ts = now
 
-        # 한 바퀴+마진을 돌았으면 방향 전환
+        # 한 바퀴+마진 완료 시 방향 전환
         full_turn_deg = 360.0 * SEARCH_FULL_TURN_MARGIN
         if self.spin_accum_deg >= full_turn_deg:
             self.spin_accum_deg = 0.0
-            self.search_dir *= -1  # 방향 전환
+            self.search_dir *= -1
             return f"Searching: turn swap ({'L' if self.search_dir>0 else 'R'})"
 
         return f"Searching: {self._search_phase} ({'L' if self.search_dir>0 else 'R'})"
@@ -308,10 +336,10 @@ def main():
                 y_center = (ymin + ymax) * 0.5
                 x_dev = 0.5 - x_center
 
-                status = follow.drive_wheels(x_dev, y_max=ymax)
+                status = follow.drive_wheels(x_dev, ymin=ymin, ymax=ymax)
                 pan_cmd, tilt_cmd = follow.aim_servos(x_center, y_center)
 
-                # 검색 상태 변수 리셋(다음에 SEARCHING 들어갈 때 새로 시작)
+                # 검색 상태 변수 리셋
                 follow.spin_accum_deg = 0.0
                 follow._search_phase = "BURST"
                 follow._phase_ts = 0.0
@@ -340,7 +368,7 @@ def main():
                         follow._phase_ts = 0.0
                         follow.stop()
                     status = follow.searching_step()
-                    pan_cmd, tilt_cmd = follow.pan, follow.tilt  # searching_step 내부에서 aim_servos 호출
+                    pan_cmd, tilt_cmd = follow.pan, follow.tilt
 
             # --- Rendering / HUD ---
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -349,7 +377,7 @@ def main():
                 (xmin, ymin, xmax, ymax) = best["bbox"]
                 x0, y0, x1, y1 = int(xmin * w), int(ymin * h), int(xmax * w), int(ymax * h)
                 cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                label_text = f"LBL=person score={best['score']:.2f} ymax={ymax:.2f}"
+                label_text = f"LBL=person score={best['score']:.2f} h={(ymax-ymin):.2f}"
 
             cv2.putText(bgr, f"STATE: {follow.state} | STATUS: {status}", (10, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
