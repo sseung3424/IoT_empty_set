@@ -41,7 +41,7 @@ def get_output(interpreter, conf_thresh=0.3):
     for i in range(count):
         if scores[i] < conf_thresh:
             continue
-        ymin, xmin, ymax, xmax = boxes[i]  # NOTE: 모델은 (ymin, xmin, ymax, xmax)
+        ymin, xmin, ymax, xmax = boxes[i]  # 모델은 (ymin, xmin, ymax, xmax)
         results.append({
             "bbox": (float(xmin), float(ymin), float(xmax), float(ymax)),  # (xmin, ymin, xmax, ymax)
             "score": float(scores[i]),
@@ -63,7 +63,7 @@ MAX_SPEED  = 120
 MIN_SPEED  = 60
 Kx = 200.0
 CENTER_DEADZONE = 0.10       # x_dev 데드존(조향 0)
-STOP_NEAR_Y     = 0.90       # 근접 정지 기준(ymax)
+STOP_NEAR_Y     = 0.90       # 근접 정지(ymax 기준)
 
 # 서보
 PAN_ID = 0
@@ -78,8 +78,9 @@ PAN_MIN, PAN_MAX   = 0, 180
 TILT_MIN, TILT_MAX = 45, 120 # 90°(센터) 포함되도록 확장
 
 # 상태 전이/검색
-LOST_TIMEOUT = 3.0
-SEARCH_SPEED = 50  # (좌스핀 제거했지만 남겨둠)
+LOST_TIMEOUT = 0.6           # 마지막 검출 후 이 시간 내엔 'LOST'로 정지 유지
+SEARCH_ENTER_TIMEOUT = 2.0   # 이 시간을 넘기면 SEARCHING 진입
+# (둘을 분리: 짧게는 안전정지, 길어지면 검색으로)
 
 # --- 서보 흔들림 완화 ---
 CENTER_EMA = 0.70            # 검출 중심 좌표 EMA(이전값 비중)
@@ -91,7 +92,12 @@ CENTER_DEADZONE_SERVO = 0.04 # 서보용 중심 데드존(정규화)
 CRUISE_DEADZONE = 0.18       # 이 안에선 완전 직진(좌우 동일 속도)
 DELTA_EMA       = 0.60       # Δ(조향) 저역통과 EMA(이전값 비중)
 MAX_DELTA_STEP  = 10.0       # 프레임당 Δ 변화 상한
-MISS_ALLOW      = 2          # 연속 미검출 허용 프레임 수(히스테리시스)
+
+# --- 검색 패턴(Searching) ---
+SEARCH_SWEEP_HZ     = 0.5    # 서보 팬 좌↔우 스윕 주파수(Hz)
+SEARCH_SWEEP_AMPL   = 0.35   # x_center 스윕 진폭(0.5±ampl, 0~1 범위로 유지)
+SEARCH_SPIN_SPEED   = 45     # 좌/우 스핀 속도
+SEARCH_SPIN_SWAP_S  = 3.0    # 좌→우 스핀 방향 전환 주기(초)
 # ----------------------------------------------------
 
 class Follower:
@@ -99,8 +105,9 @@ class Follower:
         self.car = car
         self.pan = PAN_CENTER
         self.tilt = TILT_CENTER
-        self.state = "SEARCHING"
-        self.last_seen_ts = 0.0
+        self.state = "SEARCHING"      # 초기엔 검색 상태
+        self.last_seen_ts = 0.0       # 마지막 검출 시각
+        self.search_start_ts = 0.0     # 검색 시작 시각
 
         # 서보 좌표 스무딩
         self.xc_smooth = 0.5
@@ -215,6 +222,26 @@ class Follower:
             print("Servo write failed:", e)
         return pan_cmd, tilt_cmd
 
+    # -------- 검색 패턴(사람 미검출 시) --------
+    def searching_step(self):
+        """
+        서보: 팬 좌↔우 스윕 (0.5 ± SEARCH_SWEEP_AMPL, sin 파형)
+        차체: 좌/우 스핀을 SEARCH_SPIN_SWAP_S마다 교대
+        """
+        now = time.monotonic()
+        t = now - self.search_start_ts
+        # 팬 스윕
+        x_center = 0.5 + SEARCH_SWEEP_AMPL * np.sin(2 * np.pi * SEARCH_SWEEP_HZ * t)
+        self.aim_servos(x_center, 0.5)
+        # 좌/우 스핀 교대
+        phase = int(t // SEARCH_SPIN_SWAP_S) % 2
+        if phase == 0:
+            self.car.Car_Spin_Left(SEARCH_SPIN_SPEED, SEARCH_SPIN_SPEED)
+            return "Searching: spin L"
+        else:
+            self.car.Car_Spin_Right(SEARCH_SPIN_SPEED, SEARCH_SPIN_SPEED)
+            return "Searching: spin R"
+
 def main():
     labels = load_labels(os.path.join(MODEL_DIR, LABELS_TXT))
     interpreter = make_interpreter_cpu(os.path.join(MODEL_DIR, MODEL_CPU))
@@ -229,8 +256,6 @@ def main():
     picam2.start()
     time.sleep(0.5)
     WINDOW = "Follower"
-
-    miss_count = 0  # 연속 미검출 카운터(히스테리시스)
 
     try:
         while True:
@@ -248,11 +273,12 @@ def main():
 
             status = "Idle"
             pan_cmd, tilt_cmd = follow.pan, follow.tilt
+            now = time.monotonic()
 
             if best is not None:
-                miss_count = 0
+                # ---- TRACKING ----
                 follow.state = "TRACKING"
-                follow.last_seen_ts = time.monotonic()
+                follow.last_seen_ts = now
 
                 xmin, ymin, xmax, ymax = best["bbox"]
                 x_center = (xmin + xmax) * 0.5
@@ -263,21 +289,29 @@ def main():
                 pan_cmd, tilt_cmd = follow.aim_servos(x_center, y_center)
 
             else:
-                miss_count += 1
+                # ---- NO DETECTION ----
+                dt_since_seen = now - follow.last_seen_ts
 
-                # TRACKING 중이었고, 충분히 오래/여러 프레임 놓쳤을 때만 SEARCHING 전환
-                if (follow.state == "TRACKING" and
-                    miss_count > MISS_ALLOW and
-                    (time.monotonic() - follow.last_seen_ts) > LOST_TIMEOUT):
-                    print("Target lost (hysteresis). Entering SEARCH mode.")
-                    follow.state = "SEARCHING"
+                if dt_since_seen <= LOST_TIMEOUT:
+                    # LOST (짧은 정지): 안전을 위해 즉시 정지, 시선만 중앙 복귀
+                    follow.state = "LOST"
                     follow.stop()
-
-                if follow.state == "SEARCHING":
-                    status = "Searching straight..."
-                    # 시선은 중앙, 차체는 저속 직진 유지
                     pan_cmd, tilt_cmd = follow.aim_servos(0.5, 0.5)
-                    car.Car_Run(MIN_SPEED, MIN_SPEED)
+                    status = "Lost: hold & center"
+                elif dt_since_seen <= SEARCH_ENTER_TIMEOUT:
+                    # LOST 연장: 계속 정지하며 시선 중앙(진입 지연 구간)
+                    follow.state = "LOST"
+                    follow.stop()
+                    pan_cmd, tilt_cmd = follow.aim_servos(0.5, 0.5)
+                    status = "Lost: waiting search"
+                else:
+                    # SEARCHING 진입 및 유지
+                    if follow.state != "SEARCHING":
+                        follow.state = "SEARCHING"
+                        follow.search_start_ts = now
+                        follow.stop()  # 전환 시 정지 후 스핀 시작
+                    status = follow.searching_step()
+                    pan_cmd, tilt_cmd = follow.pan, follow.tilt  # searching_step 내부에서 aim_servos 호출
 
             # --- Rendering / HUD ---
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -288,7 +322,7 @@ def main():
                 cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
                 label_text = f"LBL=person score={best['score']:.2f} ymax={ymax:.2f}"
 
-            cv2.putText(bgr, f"STATUS: {status}", (10, 20),
+            cv2.putText(bgr, f"STATE: {follow.state} | STATUS: {status}", (10, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.putText(bgr, label_text, (10, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -298,9 +332,7 @@ def main():
 
             if (cv2.waitKey(1) & 0xFF) == 27:  # ESC
                 break
-
-            # 선택: CPU 양보
-            # time.sleep(0.001)
+            # time.sleep(0.001)  # 선택: CPU 양보
 
     except KeyboardInterrupt:
         print("\nProgram stopped by user.")
