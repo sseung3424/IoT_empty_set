@@ -207,7 +207,7 @@ def run_detection(on_fall=None):
                     res_first, res_second = res_second, None
         if USE_DISPLAY:
             # 예: 화면에 띄우는 최종 BGR 프레임이 'canvas' 라면:
-            stream_publish(canvas)    # <-- 이 한 줄 추가
+            stream_publish(frame)    # <-- 이 한 줄 추가
             # 혹은 변수명이 frame/vis/bgr 등이라면 그 이름을 넣어 주세요.
 
             cv2.imshow("Video Feed", res.plot())
