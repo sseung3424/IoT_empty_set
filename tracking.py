@@ -41,7 +41,7 @@ def get_output(interpreter, conf_thresh=0.3):
     for i in range(count):
         if scores[i] < conf_thresh:
             continue
-        ymin, xmin, ymax, xmax = boxes[i]
+        ymin, xmin, ymax, xmax = boxes[i]  # NOTE: 모델은 (ymin, xmin, ymax, xmax)
         results.append({
             "bbox": (float(xmin), float(ymin), float(xmax), float(ymax)),  # (xmin, ymin, xmax, ymax)
             "score": float(scores[i]),
@@ -57,38 +57,41 @@ LABELS_TXT  = "coco_labels.txt"
 CONF_THRESH = 0.40
 TARGET_LABEL = "person"
 
+# 차동 구동
 BASE_SPEED = 100
 MAX_SPEED  = 120
 MIN_SPEED  = 60
 Kx = 200.0
-CENTER_DEADZONE = 0.10
-STOP_NEAR_Y     = 0.90
+CENTER_DEADZONE = 0.10       # x_dev 데드존(조향 0)
+STOP_NEAR_Y     = 0.90       # 근접 정지 기준(ymax)
 
+# 서보
 PAN_ID = 0
 TILT_ID = 1
 PAN_CENTER  = 90
 TILT_CENTER = 90
-
-# 이득(서보 민감도) – 흔들림 억제를 위해 기존 대비 하향
-PAN_GAIN    = 105.0   # (기존 150.0)
-TILT_GAIN   = 84.0    # (기존 120.0)
-
-# 서보 완충(EMA 비율: 이전값 가중치)
-PAN_SMOOTH  = 0.20
+PAN_GAIN    = 105.0          # 흔들림 완화 위해 하향
+TILT_GAIN   = 84.0
+PAN_SMOOTH  = 0.20           # 서보 명령 EMA(이전값 가중치)
 TILT_SMOOTH = 0.30
-
-# 각도 제한: 반드시 90°(센터)를 포함하도록 범위를 넓힘
 PAN_MIN, PAN_MAX   = 0, 180
-TILT_MIN, TILT_MAX = 45, 120
+TILT_MIN, TILT_MAX = 45, 120 # 90°(센터) 포함되도록 확장
 
+# 상태 전이/검색
 LOST_TIMEOUT = 3.0
-SEARCH_SPEED = 50
+SEARCH_SPEED = 50  # (좌스핀 제거했지만 남겨둠)
 
-# --- 흔들림 완화 파라미터 ---
-CENTER_EMA = 0.70                 # 검출 중심 좌표 EMA(이전값 가중치)
-SERVO_UPDATE_HZ = 12              # 서보 갱신 빈도(Hz)
-MAX_STEP_DEG = 2                  # 프레임당 최대 각도 변화(±deg)
-CENTER_DEADZONE_SERVO = 0.04      # 서보용 중심 데드존(정규화 좌표 기준)
+# --- 서보 흔들림 완화 ---
+CENTER_EMA = 0.70            # 검출 중심 좌표 EMA(이전값 비중)
+SERVO_UPDATE_HZ = 12         # 서보 갱신 빈도(Hz)
+MAX_STEP_DEG = 2             # 프레임당 서보 각도 변화 상한
+CENTER_DEADZONE_SERVO = 0.04 # 서보용 중심 데드존(정규화)
+
+# --- 차동 조향 직진화 ---
+CRUISE_DEADZONE = 0.18       # 이 안에선 완전 직진(좌우 동일 속도)
+DELTA_EMA       = 0.60       # Δ(조향) 저역통과 EMA(이전값 비중)
+MAX_DELTA_STEP  = 10.0       # 프레임당 Δ 변화 상한
+MISS_ALLOW      = 2          # 연속 미검출 허용 프레임 수(히스테리시스)
 # ----------------------------------------------------
 
 class Follower:
@@ -99,12 +102,14 @@ class Follower:
         self.state = "SEARCHING"
         self.last_seen_ts = 0.0
 
-        # 검출 중심 좌표 스무딩 상태
+        # 서보 좌표 스무딩
         self.xc_smooth = 0.5
         self.yc_smooth = 0.5
-
-        # 서보 업데이트 타이밍
         self._servo_next_ts = 0.0
+
+        # 조향 Δ 스무딩/리미트
+        self.delta_smooth = 0.0
+        self._last_delta  = 0.0
 
         try:
             self.car.Ctrl_Servo(PAN_ID, self.pan)
@@ -119,28 +124,48 @@ class Follower:
     def stop(self):
         self.car.Car_Stop()
 
+    # -------- 바퀴 제어(직진 중심) --------
     def drive_wheels(self, x_dev, y_max):
         # 근접 정지
         if y_max > STOP_NEAR_Y:
             self.stop()
             return "Stop"
-        # 중앙 근처는 조향 0
-        if abs(x_dev) < CENTER_DEADZONE:
-            delta = 0
-        else:
-            delta = int(Kx * x_dev)
 
-        l = self._clamp(BASE_SPEED - delta, MIN_SPEED, MAX_SPEED)
-        r = self._clamp(BASE_SPEED + delta, MIN_SPEED, MAX_SPEED)
+        # ① 크루즈 창: 중앙 근처는 완전 직진
+        if abs(x_dev) <= CRUISE_DEADZONE:
+            self.delta_smooth = 0.0
+            l = r = self._clamp(BASE_SPEED, MIN_SPEED, MAX_SPEED)
+            self.car.Car_Run(l, r)
+            return "Cruise(Ω)"
+
+        # ② 원시 Δ
+        raw_delta = float(Kx * x_dev)
+
+        # ③ Δ 저역통과(EMA)
+        delta_lp = DELTA_EMA * self.delta_smooth + (1.0 - DELTA_EMA) * raw_delta
+
+        # ④ Δ 레이트 리미트
+        step = delta_lp - self._last_delta
+        if step >  MAX_DELTA_STEP:
+            delta_lp = self._last_delta + MAX_DELTA_STEP
+        elif step < -MAX_DELTA_STEP:
+            delta_lp = self._last_delta - MAX_DELTA_STEP
+
+        self._last_delta  = delta_lp
+        self.delta_smooth = delta_lp
+
+        # ⑤ 좌/우 속도 적용
+        l = self._clamp(int(BASE_SPEED - delta_lp), MIN_SPEED, MAX_SPEED)
+        r = self._clamp(int(BASE_SPEED + delta_lp), MIN_SPEED, MAX_SPEED)
         self.car.Car_Run(l, r)
 
-        if delta > 10: return f"Forward-R({r})"
-        elif delta < -10: return f"Forward-L({l})"
-        else: return "Forward"
+        if delta_lp > 10:  return f"Fwd-R({r})"
+        if delta_lp < -10: return f"Fwd-L({l})"
+        return "Forward"
 
+    # -------- 서보 제어(안정화 포함, 단일 정의) --------
     def aim_servos(self, x_center, y_center):
         """
-        서보 안정화 포함:
         1) 검출 중심 좌표 EMA 스무딩
         2) 서보 중심 데드존
         3) 업데이트 주기 제한(SERVO_UPDATE_HZ)
@@ -205,6 +230,8 @@ def main():
     time.sleep(0.5)
     WINDOW = "Follower"
 
+    miss_count = 0  # 연속 미검출 카운터(히스테리시스)
+
     try:
         while True:
             rgb = picam2.capture_array()
@@ -223,8 +250,10 @@ def main():
             pan_cmd, tilt_cmd = follow.pan, follow.tilt
 
             if best is not None:
+                miss_count = 0
                 follow.state = "TRACKING"
                 follow.last_seen_ts = time.monotonic()
+
                 xmin, ymin, xmax, ymax = best["bbox"]
                 x_center = (xmin + xmax) * 0.5
                 y_center = (ymin + ymax) * 0.5
@@ -232,20 +261,26 @@ def main():
 
                 status = follow.drive_wheels(x_dev, y_max=ymax)
                 pan_cmd, tilt_cmd = follow.aim_servos(x_center, y_center)
+
             else:
-                if follow.state == "TRACKING" and time.monotonic() - follow.last_seen_ts > LOST_TIMEOUT:
-                    print("Target lost for too long. Entering SEARCH mode.")
+                miss_count += 1
+
+                # TRACKING 중이었고, 충분히 오래/여러 프레임 놓쳤을 때만 SEARCHING 전환
+                if (follow.state == "TRACKING" and
+                    miss_count > MISS_ALLOW and
+                    (time.monotonic() - follow.last_seen_ts) > LOST_TIMEOUT):
+                    print("Target lost (hysteresis). Entering SEARCH mode.")
                     follow.state = "SEARCHING"
                     follow.stop()
 
                 if follow.state == "SEARCHING":
-                    status = "Searching..."
+                    status = "Searching straight..."
+                    # 시선은 중앙, 차체는 저속 직진 유지
                     pan_cmd, tilt_cmd = follow.aim_servos(0.5, 0.5)
-                    car.Car_Spin_Left(SEARCH_SPEED, SEARCH_SPEED)
+                    car.Car_Run(MIN_SPEED, MIN_SPEED)
 
-            # --- Rendering ---
+            # --- Rendering / HUD ---
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            # 디버그: 라벨/점수/근접지표 확인용(필요시 주석 해제)
             label_text = "NO PERSON"
             if best:
                 (xmin, ymin, xmax, ymax) = best["bbox"]
@@ -264,7 +299,7 @@ def main():
             if (cv2.waitKey(1) & 0xFF) == 27:  # ESC
                 break
 
-            # CPU 양보(선택)
+            # 선택: CPU 양보
             # time.sleep(0.001)
 
     except KeyboardInterrupt:
