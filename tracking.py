@@ -3,6 +3,7 @@ import os
 import time
 import numpy as np
 import cv2
+from collections import deque
 from picamera2 import Picamera2
 from YB_Pcb_Car import YB_Pcb_Car
 from tflite_runtime.interpreter import Interpreter  # tflite import
@@ -64,9 +65,18 @@ MIN_SPEED  = 60
 Kx = 200.0
 CENTER_DEADZONE = 0.10
 
-# 근접 정지(박스 높이 기반 + 히스테리시스)
-STOP_NEAR_H_ENGAGE  = 0.60   # 이 이상이면 "가깝다"로 판단 → 정지
-STOP_NEAR_H_RELEASE = 0.55   # 이 미만이면 "가까움 해제" → 주행 재개
+# --- 근접 정지(박스 높이 기반 + 히스테리시스) ---
+# 초기엔 "2m쯤 거리"를 가정한 박스 높이(h_norm) 목표치로 시작(현장서 자동보정됨)
+INIT_TARGET_FOLLOW_H = 0.38      # 2m 근처에서 사람 박스 높이(경험값, 자동보정보완)
+NEAR_ENGAGE_FACTOR   = 1.18      # 멈춤 문턱 = target_h * 1.18
+NEAR_RELEASE_FACTOR  = 0.95      # 해제 문턱 = target_h * 0.95
+
+# 자동 보정(주행 중 측정) 파라미터
+AUTO_TUNE_ENABLED  = True
+TUNE_WARMUP_S      = 1.0         # Tracking 진입 후 워밍업 시간
+TUNE_WINDOW_S      = 2.5         # 샘플 수집 시간
+TUNE_MIN_SAMPLES   = 20
+TUNE_MIN_H, TUNE_MAX_H = 0.08, 0.85  # 이상치 필터
 
 # 서보
 PAN_ID = 0
@@ -104,9 +114,9 @@ SEARCH_FULL_TURN_MARGIN = 1.10       # 360°의 10% 여유
 SEARCH_BURST_MS = 180   # 회전하는 구간(ms)
 SEARCH_HOLD_MS  = 140   # 정지하여 탐지하는 구간(ms)
 
-# 팬 스윕(서보 각도 기준으로 정확히 ±30° 보장)
-PAN_SWEEP_AMPL_DEG = 30.0    # 원하는 팬 스윕 각도(±deg)
-SEARCH_SWEEP_HZ    = 0.4     # 스윕 주파수(Hz)
+# 팬 스윕(서보 각도 기준) —— 요청: ±90°
+PAN_SWEEP_AMPL_DEG = 90.0
+SEARCH_SWEEP_HZ    = 0.35    # 넓은 각이면 살짝 더 느리게
 # ----------------------------------------------------
 
 class Follower:
@@ -126,8 +136,16 @@ class Follower:
         self.delta_smooth = 0.0
         self._last_delta  = 0.0
 
-        # 근접 히스테리시스 상태
+        # 근접 히스테리시스 (동적 문턱)
+        self.target_follow_h = INIT_TARGET_FOLLOW_H
+        self.near_engage = self.target_follow_h * NEAR_ENGAGE_FACTOR
+        self.near_release = self.target_follow_h * NEAR_RELEASE_FACTOR
         self.near = False
+
+        # 거리 자동보정 상태
+        self.tune_active = False
+        self.tune_start_ts = 0.0
+        self.tune_buf = deque(maxlen=512)
 
         # Searching 상태 변수
         self.search_start_ts = 0.0
@@ -149,18 +167,51 @@ class Follower:
     def stop(self):
         self.car.Car_Stop()
 
+    # ---------- 거리 자동보정 ----------
+    def _maybe_start_tune(self):
+        if not AUTO_TUNE_ENABLED or self.tune_active:
+            return
+        self.tune_active = True
+        self.tune_start_ts = time.monotonic()
+        self.tune_buf.clear()
+
+    def _maybe_collect_tune(self, h_norm, move_status):
+        """Cruise/Forward 중에만 샘플 수집."""
+        if not self.tune_active:
+            return
+        now = time.monotonic()
+        if now - self.tune_start_ts < TUNE_WARMUP_S:
+            return
+        if TUNE_MIN_H <= h_norm <= TUNE_MAX_H and move_status:
+            self.tune_buf.append(h_norm)
+
+    def _maybe_finish_tune(self):
+        if not self.tune_active:
+            return
+        now = time.monotonic()
+        if (now - self.tune_start_ts) >= (TUNE_WARMUP_S + TUNE_WINDOW_S) and len(self.tune_buf) >= TUNE_MIN_SAMPLES:
+            med = float(np.median(self.tune_buf))
+            # 업데이트(안정적으로 약간의 여유 둠)
+            self.target_follow_h = med
+            self.near_engage  = self.target_follow_h * NEAR_ENGAGE_FACTOR
+            self.near_release = self.target_follow_h * NEAR_RELEASE_FACTOR
+            # 범위 안전망
+            self.near_engage  = float(self._clamp(self.near_engage, 0.10, 0.90))
+            self.near_release = float(self._clamp(self.near_release, 0.05, self.near_engage - 0.02))
+            self.tune_active = False  # 1회 보정(원하면 주기적 재보정으로 바꿀 수 있음)
+
     # -------- 바퀴 제어(직진 중심) --------
     def drive_wheels(self, x_dev, ymin, ymax):
-        # 근접 정지 판단: 박스 높이 기반 + 히스테리시스
+        # 근접 정지 판단: 박스 높이 기반 + 히스테리시스(동적 문턱)
         h_norm = float(max(0.0, ymax - ymin))
         if self.near:
-            if h_norm < STOP_NEAR_H_RELEASE:
+            if h_norm < self.near_release:
                 self.near = False  # 근접 해제 → 주행 가능
             else:
                 self.stop()
                 return "Stop(near)"
         else:
-            if h_norm > STOP_NEAR_H_ENGAGE:
+            if h_norm > self.near_engage:
                 self.near = True
                 self.stop()
                 return "Stop(near)"
@@ -248,12 +299,14 @@ class Follower:
             print("Servo write failed:", e)
         return pan_cmd, tilt_cmd
 
-    # -------- 검색 패턴(한 바퀴 보장 + step-and-stare + ±30° 팬 스윕) --------
+    # -------- 검색 패턴(한 바퀴 보장 + step-and-stare + ±90° 팬 스윕) --------
     def searching_step(self):
         now = time.monotonic()
         # 팬을 정확히 ±PAN_SWEEP_AMPL_DEG로 스윕
         t = now - self.search_start_ts
         pan_target = PAN_CENTER + PAN_SWEEP_AMPL_DEG * np.sin(2 * np.pi * SEARCH_SWEEP_HZ * t)
+        # 범위 안전(0~180) 내로 들어오도록 보장
+        pan_target = self._clamp(pan_target, PAN_MIN, PAN_MAX)
         self.aim_servos_to_angles(pan_target, self.tilt)
 
         # 각속도(°/s) 추정
@@ -339,6 +392,17 @@ def main():
                 status = follow.drive_wheels(x_dev, ymin=ymin, ymax=ymax)
                 pan_cmd, tilt_cmd = follow.aim_servos(x_center, y_center)
 
+                # ------ 거리 자동보정(주행 중일 때) ------
+                h_norm = float(max(0.0, ymax - ymin))
+                is_moving = status.startswith("Cruise") or status.startswith("Forward") or status.startswith("Fwd-")
+                if AUTO_TUNE_ENABLED and is_moving and not follow.near:
+                    follow._maybe_start_tune()
+                    follow._maybe_collect_tune(h_norm, move_status=True)
+                    follow._maybe_finish_tune()
+                else:
+                    # 정지/근접/탐색 중에는 수집하지 않음
+                    pass
+
                 # 검색 상태 변수 리셋
                 follow.spin_accum_deg = 0.0
                 follow._search_phase = "BURST"
@@ -377,12 +441,17 @@ def main():
                 (xmin, ymin, xmax, ymax) = best["bbox"]
                 x0, y0, x1, y1 = int(xmin * w), int(ymin * h), int(xmax * w), int(ymax * h)
                 cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                label_text = f"LBL=person score={best['score']:.2f} h={(ymax-ymin):.2f}"
+                h_norm = (ymax - ymin)
+                label_text = f"LBL=person score={best['score']:.2f} h={h_norm:.2f}"
 
-            cv2.putText(bgr, f"STATE: {follow.state} | STATUS: {status}", (10, 20),
+            hud_state = f"STATE: {follow.state} | STATUS: {status}"
+            hud_dist  = f"h*={follow.target_follow_h:.2f} NE({follow.near_engage:.2f}) NR({follow.near_release:.2f})"
+            cv2.putText(bgr, hud_state, (10, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.putText(bgr, label_text, (10, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(bgr, hud_dist, (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
             cv2.putText(bgr, f"PAN={int(pan_cmd)} TILT={int(tilt_cmd)}", (w - 230, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
             cv2.imshow(WINDOW, bgr)
