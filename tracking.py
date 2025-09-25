@@ -73,7 +73,7 @@ TILT_GAIN   = 120.0
 PAN_SMOOTH  = 0.20
 TILT_SMOOTH = 0.30
 PAN_MIN, PAN_MAX   = 0, 180
-TILT_MIN, TILT_MAX = 45, 90
+TILT_MIN, TILT_MAX = 45, 70
 
 LOST_TIMEOUT = 3.0
 SEARCH_SPEED = 50
@@ -96,6 +96,12 @@ class Follower:
         self.tilt = TILT_CENTER
         self.state = "SEARCHING"
         self.last_seen_ts = 0.0
+
+        self.xc_smooth = 0.5
+        self.yc_smooth = 0.5
+
+        self._servo_next_ts = 0.0
+
         try:
             self.car.Ctrl_Servo(PAN_ID, self.pan)
             self.car.Ctrl_Servo(TILT_ID, self.tilt)
@@ -105,6 +111,60 @@ class Follower:
     @staticmethod
     def _clamp(v, lo, hi):
         return max(lo, min(hi, v))
+    
+    def aim_servos(self, x_center, y_center):
+        """
+        변경점:
+        1) 입력 중심 좌표를 EMA로 스무딩
+        2) 데드존: 중심 근처면 갱신 생략
+        3) 레이트 리미트: 프레임당 각도 변화 제한
+        4) 업데이트 주기 제한: SERVO_UPDATE_HZ로만 갱신
+        """
+        # 1) 좌표 스무딩 (EMA: 이전값 비중 CENTER_EMA)
+        self.xc_smooth = CENTER_EMA * self.xc_smooth + (1.0 - CENTER_EMA) * x_center
+        self.yc_smooth = CENTER_EMA * self.yc_smooth + (1.0 - CENTER_EMA) * y_center
+
+        # 2) 데드존 체크
+        if abs(self.xc_smooth - 0.5) < CENTER_DEADZONE_SERVO and \
+           abs(self.yc_smooth - 0.5) < CENTER_DEADZONE_SERVO:
+            # 너무 미세한 오차는 무시: 현재 각도 유지, 보드 전달도 생략
+            return int(self.pan), int(self.tilt)
+
+        # 4) 업데이트 주기 제한
+        now = time.monotonic()
+        if now < self._servo_next_ts:
+            return int(self.pan), int(self.tilt)
+        period = 1.0 / SERVO_UPDATE_HZ
+        self._servo_next_ts = now + period
+
+        # 목표각 계산(기존 식 그대로, 단 스무딩된 중심 사용)
+        pan_target  = PAN_CENTER + (0.5 - self.xc_smooth) * PAN_GAIN
+        tilt_target = TILT_CENTER - (self.yc_smooth - 0.5) * TILT_GAIN
+
+        # 기존 EMA 완충(기존 코드 유지)
+        self.pan  = (1 - PAN_SMOOTH)  * pan_target  + PAN_SMOOTH  * self.pan
+        self.tilt = (1 - TILT_SMOOTH) * tilt_target + TILT_SMOOTH * self.tilt
+
+        # 3) 레이트 리미트(프레임당 변화량 제한)
+        def limit_step(curr, prev):
+            delta = curr - prev
+            if   delta >  MAX_STEP_DEG: curr = prev + MAX_STEP_DEG
+            elif delta < -MAX_STEP_DEG: curr = prev - MAX_STEP_DEG
+            return curr
+
+        # 이전 명령값 보관 후 제한 적용
+        prev_pan, prev_tilt = self.pan, self.tilt
+        self.pan  = limit_step(self.pan,  prev_pan)
+        self.tilt = limit_step(self.tilt, prev_tilt)
+
+        pan_cmd  = int(self._clamp(round(self.pan),  PAN_MIN,  PAN_MAX))
+        tilt_cmd = int(self._clamp(round(self.tilt), TILT_MIN, TILT_MAX))
+        try:
+            self.car.Ctrl_Servo(PAN_ID, pan_cmd)
+            self.car.Ctrl_Servo(TILT_ID, tilt_cmd)
+        except Exception as e:
+            print("Servo write failed:", e)
+        return pan_cmd, tilt_cmd
 
     def stop(self):
         self.car.Car_Stop()
